@@ -185,7 +185,7 @@ func TestConformance(t *testing.T) {
 					Image:    image,
 					Protocol: protocol,
 					New:      func(t *testing.T) conformance.ControlPlane { return &myLibrary{cache: mylib.NewCache()} },
-					Skip:     map[string]string{"RecoversFromRejectedConfig": "known bug: ..."},
+					Skip:     map[string]string{"ContainsRejectedConfig": "known bug: ..."},
 				})
 			})
 		}
@@ -193,15 +193,17 @@ func TestConformance(t *testing.T) {
 }
 ```
 
-Implement `Idle() bool` too (`conformance.IdleReporter`) if your library can tell when its latest stream is idle.
+Implement `Idle() bool` too (`conformance.IdleReporter`) if your library can tell when its latest stream is idle, and
+`Resync()` (`conformance.Resyncer`) if it can make Envoy reconnect.
 The scenarios:
 
 - `StartsEmpty`: no config at first. Envoy gets an answer for every type it asks for, including a route config that
   doesn't exist yet, then takes the first service.
 - `AddsAndRemovesServices`: a route, its cluster and its endpoints added in one change, then removed in one change.
 - `MovesRouteToNewCluster`: a route moved to a new cluster, and the old cluster removed, in one change.
-- `RecoversFromRejectedConfig`: Envoy NACKs a bad cluster, and the next good config still gets through on the same
-  stream.
+- `ContainsRejectedConfig`: Envoy NACKs a bad cluster. The library mustn't send it again, not even as part of a later
+  change, nor drop Envoy into a reconnect loop, and Envoy must keep serving its last good config. If it implements
+  `conformance.Resyncer`, a fixed config must get through after `Resync()`.
 - `Reconnects`: a service is removed while Envoy is disconnected. After it reconnects, traffic still flows and updates
   still work.
 
