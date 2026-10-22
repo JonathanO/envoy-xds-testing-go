@@ -1,0 +1,5 @@
+Envoy xDS testing for Go
+Copyright 2026 Jonathan Oddy.
+
+Ported from envoy-xds-testing in java-envoy-xds (https://github.com/JonathanO/java-envoy-xds), which includes work
+by Wise Plc, licensed under the Apache License, Version 2.0.
