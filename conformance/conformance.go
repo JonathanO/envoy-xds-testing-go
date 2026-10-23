@@ -69,6 +69,9 @@ type Options struct {
 	New func(t *testing.T) ControlPlane
 	// Skip records known deviations: test name to reason.
 	Skip map[string]string
+	// RateLimitedADS rate limits Envoy's requests to the control plane (rate_limit_settings), so it queues them. Delta
+	// Envoy then sends ACKs ahead of its queued subscriptions, so after a reconnect requests arrive in another order.
+	RateLimitedADS bool
 }
 
 const (
@@ -193,6 +196,7 @@ func reconnects(h *harness) {
 	h.cp.SetConfig(services("foo"))
 	h.start()
 	c := h.synced(2) // ignores Envoy's warnings about the disconnect
+	h.assertRateLimitedIfAsked()
 	h.must(h.checkpoint.SaneAfterReconnect(h.ctx, nil))
 	h.assertStatus("foo", 200)
 	h.assertStatus("bar", 404)
@@ -214,6 +218,7 @@ func changesWhileDisconnected(h *harness) {
 	h.cp.SetConfig(service("foo", "foo-v2"))
 	h.start()
 	h.synced(2)
+	h.assertRateLimitedIfAsked()
 	h.must(h.checkpoint.SaneAfterReconnect(h.ctx, before))
 	h.must(h.envoy.RoutedVia(h.ctx, listenerPort, "foo", "foo-v2"))
 	// and foo-v1 goes, once nothing uses it
@@ -269,10 +274,39 @@ func (h *harness) start() {
 		if h.o.Protocol == Delta {
 			bootstrap = deltaBootstrap
 		}
+		if h.o.RateLimitedADS {
+			bootstrap = rateLimited(h.t, bootstrap)
+		}
 		h.envoy, err = xdstest.StartEnvoy(h.ctx, xdstest.EnvoyConfig{
 			Image: h.o.Image, Bootstrap: bootstrap, ADSPort: adsPort, ListenerPorts: []int{listenerPort}, Args: []string{"-l", "debug"},
 		})
 		h.must(err)
+	}
+}
+
+// rateLimited adds rate_limit_settings to the ADS config: one request at a time, ten a second, enough to queue Envoy's
+// reconnect burst behind the answers to it.
+func rateLimited(t *testing.T, bootstrap []byte) []byte {
+	const at = "    transport_api_version: V3\n    set_node_on_first_message_only"
+	limited := strings.Replace(string(bootstrap), at,
+		"    transport_api_version: V3\n    rate_limit_settings:\n      max_tokens: 1\n      fill_rate: 10\n    set_node_on_first_message_only", 1)
+	if limited == string(bootstrap) {
+		t.Fatal("couldn't add rate_limit_settings to Envoy's config")
+	}
+	return []byte(limited)
+}
+
+// assertRateLimitedIfAsked checks a rate limited Envoy's reconnect burst hit the limit, or the option isn't testing
+// anything.
+func (h *harness) assertRateLimitedIfAsked() {
+	h.t.Helper()
+	if !h.o.RateLimitedADS {
+		return
+	}
+	stats, err := h.envoy.Stats(h.ctx)
+	h.must(err)
+	if stats["control_plane.rate_limit_enforced"] == 0 {
+		h.t.Fatal("RateLimitedADS, but Envoy never hit the rate limit")
 	}
 }
 
