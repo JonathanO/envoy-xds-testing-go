@@ -195,14 +195,13 @@ func TestSotw(t *testing.T) {
 			c := cache.NewSnapshotCache(true, cache.IDHash{}, nil)
 			return &goControlPlane{cache: c, server: server.NewServer(context.Background(), c, nil)}
 		},
-		Skip: map[string]string{"ContainsRejectedConfig": "sends the rejected cluster again"},
 	})
 }
 ```
 
-go-control-plane fails most of the suite, so the example records what it fails in `Skip`. It applies a snapshot
-one type at a time without waiting for ACKs, which breaks make before break. In ADS mode it doesn't answer a request
-for a name it doesn't have. And on SotW it sends a rejected cluster again.
+Expect that example to fail: go-control-plane fails most of the suite. It applies a snapshot one type at a time
+without waiting for ACKs, which breaks make before break. In ADS mode it doesn't answer a request for a name it doesn't
+have. And on SotW it sends a rejected cluster again.
 
 Implement `Idle() bool` too (`conformance.IdleReporter`) if your library can tell when its latest stream is idle, and
 `Resync()` (`conformance.Resyncer`) if it can make Envoy reconnect.
