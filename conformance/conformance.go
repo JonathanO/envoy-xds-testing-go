@@ -26,6 +26,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	xdstest "github.com/JonathanO/envoy-xds-testing-go"
+	"github.com/JonathanO/envoy-xds-testing-go/match"
 )
 
 // ControlPlane is the library under test.
@@ -215,6 +216,10 @@ func changesWhileDisconnected(h *harness) {
 	h.synced(2)
 	h.must(h.checkpoint.SaneAfterReconnect(h.ctx, before))
 	h.must(h.envoy.RoutedVia(h.ctx, listenerPort, "foo", "foo-v2"))
+	// and foo-v1 goes, once nothing uses it
+	h.must(xdstest.WaitFor(10*time.Second, func() error {
+		return match.InOrder(h.rec.Conversations()[1], match.AckOf(match.Response(xdstest.CDS, match.Removing("foo-v1"))))
+	}))
 }
 
 type harness struct {
