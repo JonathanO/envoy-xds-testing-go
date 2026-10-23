@@ -20,6 +20,7 @@ type sotw struct {
 
 func (s sotw) AllWereAcked() error {
 	sent := map[string]map[string]bool{} // nonces by type
+	stale := map[string]string{}         // by type: a nonce Envoy echoed from its previous stream
 	unacked := map[string]bool{}
 	for _, m := range s.c.Messages() {
 		switch m := m.(type) {
@@ -28,6 +29,7 @@ func (s sotw) AllWereAcked() error {
 				if sent[m.GetTypeUrl()] == nil {
 					// If envoy is reconnecting it may reuse nonces from its previous connection.
 					sent[m.GetTypeUrl()] = map[string]bool{nonce: true}
+					stale[m.GetTypeUrl()] = nonce
 				} else if !sent[m.GetTypeUrl()][nonce] {
 					return fmt.Errorf("unexpected response nonce %q for %s", nonce, m.GetTypeUrl())
 				}
@@ -39,6 +41,10 @@ func (s sotw) AllWereAcked() error {
 		case *discoveryv3.DiscoveryResponse:
 			if sent[m.GetTypeUrl()] == nil {
 				sent[m.GetTypeUrl()] = map[string]bool{}
+			}
+			if stale[m.GetTypeUrl()] == m.GetNonce() {
+				return fmt.Errorf("sent nonce %q for %s, which Envoy had echoed from its previous stream: its requests can't be "+
+					"told from ACKs of this response. Make nonces unique across streams", m.GetNonce(), m.GetTypeUrl())
 			}
 			if sent[m.GetTypeUrl()][m.GetNonce()] {
 				return fmt.Errorf("sent nonce %q for %s more than once", m.GetNonce(), m.GetTypeUrl())
