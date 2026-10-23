@@ -66,27 +66,17 @@ func movingAServiceToNewEndpoints(t *testing.T, bootstrapFile string, checksFor 
 	must(t, xdstest.WaitFor(10*time.Second, func() error { return checksFor(c).HadConversationsWith(xdstest.CDS, xdstest.RDS) }))
 	must(t, xdstest.WaitFor(10*time.Second, checksFor(c).AnsweredEveryType))
 	must(t, xdstest.WaitFor(30*time.Second, xdstest.Settled(c, xdstest.DefaultQuietPeriod)))
-	messageMark, logMark := c.Size(), envoy.LogSize()
+	checkpoint, err := xdstest.TakeCheckpoint(ctx, envoy, c)
+	must(t, err)
 
 	// Make a change the way your users would, and wait for it to settle. Envoy's admin port stands in for the
 	// upstream, and every 127/8 address in its container reaches it.
 	setService(t, snapshots, "2", "foo", "127.0.0.2")
-	must(t, xdstest.WaitFor(30*time.Second, xdstest.SettledAfter(c, messageMark, xdstest.Settled(c, xdstest.DefaultQuietPeriod))))
+	must(t, xdstest.WaitFor(30*time.Second, xdstest.SettledAfter(c, checkpoint.Message, xdstest.Settled(c, xdstest.DefaultQuietPeriod))))
 
-	checks := checksFor(c)
-	must(t, checks.NothingSentUnasked(false))
-	must(t, checks.AllWereAcked())
-	must(t, checks.SentNoEmptyResponses(messageMark))
-	must(t, checks.WasMakeBeforeBreak(messageMark))
-	must(t, envoy.Healthy(ctx, nil))
-	must(t, envoy.WarningsSince(logMark))
-	must(t, xdstest.WaitFor(5*time.Second, func() error {
-		status, err := envoy.HTTPStatus(ctx, 10000, "foo")
-		if err == nil && status != 200 {
-			err = errors.New("foo isn't answering 200")
-		}
-		return err
-	}))
+	// The conversation since the checkpoint, Envoy's health, and nothing in its log. Then that traffic still gets there.
+	must(t, checkpoint.Sane(ctx))
+	must(t, envoy.RoutedVia(ctx, 10000, "foo", "foo"))
 }
 
 // setService makes the whole config one service: a cluster, its endpoint, and a route to it from virtual host name.
