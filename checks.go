@@ -30,12 +30,28 @@ type Checks interface {
 	// answers to Envoy's first subscriptions aren't ordered, Envoy's own startup sequencing covers those.
 	WasMakeBeforeBreak(fromMessage int) error
 
+	// WasMakeBeforeBreakAfter is WasMakeBeforeBreak for a conversation Envoy started by reconnecting. Envoy keeps its
+	// config across a disconnect, so this starts from what it last ACKed in before, the previous conversation, and
+	// checks this one from fromMessage on, usually 0.
+	WasMakeBeforeBreakAfter(before *Conversation, fromMessage int) error
+
 	// AnsweredEveryType checks that every type Envoy asked for got at least one response. Without one Envoy waits out
 	// its initial fetch timeout, or forever if that is disabled.
 	AnsweredEveryType() error
 
 	// HadConversationsWith checks that Envoy asked for each of these types.
 	HadConversationsWith(typeURLs ...string) error
+}
+
+// ChecksFor returns Sotw or Delta checks, whichever protocol the conversation uses.
+func ChecksFor(c *Conversation) Checks {
+	for _, m := range c.Messages() {
+		switch m.(type) {
+		case *discoveryv3.DeltaDiscoveryRequest, *discoveryv3.DeltaDiscoveryResponse:
+			return Delta(c)
+		}
+	}
+	return Sotw(c)
 }
 
 func requestType(m proto.Message) (string, bool) {

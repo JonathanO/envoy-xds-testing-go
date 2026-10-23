@@ -5,6 +5,7 @@ import (
 	"slices"
 
 	discoveryv3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 )
 
@@ -132,12 +133,29 @@ func (d delta) SentNoEmptyResponses(fromMessage int) error {
 }
 
 func (d delta) WasMakeBeforeBreak(fromMessage int) error {
+	return d.WasMakeBeforeBreakAfter(nil, fromMessage)
+}
+
+func (d delta) WasMakeBeforeBreakAfter(before *Conversation, fromMessage int) error {
 	state := newAckedState()
+	if before != nil {
+		if err := replayDelta(state, before.Messages(), -1); err != nil {
+			return err
+		}
+	}
+	if err := replayDelta(state, d.c.Messages(), fromMessage); err != nil {
+		return err
+	}
+	return state.err()
+}
+
+// replayDelta tracks what Envoy ACKs in messages, checking responses from checkFrom on, or none if it's negative.
+func replayDelta(state *ackedState, messages []proto.Message, checkFrom int) error {
 	pending := map[string]*discoveryv3.DeltaDiscoveryResponse{}
-	for i, m := range d.c.Messages() {
+	for i, m := range messages {
 		switch m := m.(type) {
 		case *discoveryv3.DeltaDiscoveryResponse:
-			if i >= fromMessage {
+			if checkFrom >= 0 && i >= checkFrom {
 				if err := state.checkResponse(m.GetTypeUrl(), deltaResources(m), m.GetRemovedResources()); err != nil {
 					return err
 				}
@@ -152,7 +170,7 @@ func (d delta) WasMakeBeforeBreak(fromMessage int) error {
 			}
 		}
 	}
-	return state.err()
+	return nil
 }
 
 func (d delta) AnsweredEveryType() error {

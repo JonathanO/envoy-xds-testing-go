@@ -116,3 +116,27 @@ func TestDeltaMakeBeforeBreak(t *testing.T) {
 	wantProblem(t, err, `cluster "a" removed while Envoy's ACKed route "routes" still uses it`)
 	wantProblem(t, err, `route "routes" sent using cluster "b" before Envoy ACKed the cluster`)
 }
+
+func TestDeltaMakeBeforeBreakAfterAReconnect(t *testing.T) {
+	// Envoy left the first stream with a route to v1.
+	before := NewConversation()
+	deltaExchange(t, before, CDS, "1", nil, edsCluster("v1"))
+	deltaExchange(t, before, EDS, "2", nil, &endpointv3.ClusterLoadAssignment{ClusterName: "v1"})
+	deltaExchange(t, before, RDS, "3", nil, routeTo("v1"))
+
+	after := NewConversation()
+	deltaExchange(t, after, CDS, "4", nil, edsCluster("v1"), edsCluster("v2"))
+	deltaExchange(t, after, EDS, "5", nil, &endpointv3.ClusterLoadAssignment{ClusterName: "v2"})
+	deltaExchange(t, after, RDS, "6", nil, routeTo("v2"))
+	deltaExchange(t, after, CDS, "7", []string{"v1"})
+	if err := Delta(after).WasMakeBeforeBreakAfter(before, 0); err != nil {
+		t.Error(err)
+	}
+
+	removedFirst := NewConversation()
+	deltaExchange(t, removedFirst, CDS, "4", []string{"v1"}, edsCluster("v2"))
+	wantProblem(t, Delta(removedFirst).WasMakeBeforeBreakAfter(before, 0), `cluster "v1" removed while Envoy's ACKed route "routes" still uses it`)
+	if err := Delta(removedFirst).WasMakeBeforeBreak(0); err != nil {
+		t.Errorf("without the conversation before, there's nothing to compare with: %v", err)
+	}
+}
