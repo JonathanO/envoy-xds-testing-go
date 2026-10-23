@@ -1,11 +1,12 @@
-module github.com/JonathanO/envoy-xds-testing-go/examples
+module github.com/JonathanO/envoy-xds-testing-go/examples/controlplane
 
 go 1.26.0
 
-replace github.com/JonathanO/envoy-xds-testing-go => ../
+// Builds against this checkout. Copying the example elsewhere? Drop this line.
+replace github.com/JonathanO/envoy-xds-testing-go => ../..
 
 require (
-	github.com/JonathanO/envoy-xds-testing-go v0.0.0-20261023071812-889bc410ae07
+	github.com/JonathanO/envoy-xds-testing-go v0.0.0-20261023094359-d235259cea86
 	github.com/envoyproxy/go-control-plane v0.14.0
 	github.com/envoyproxy/go-control-plane/envoy v1.40.0
 	google.golang.org/grpc v1.84.0
