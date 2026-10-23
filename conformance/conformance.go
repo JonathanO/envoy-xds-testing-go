@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -60,18 +61,26 @@ const (
 	Delta Protocol = "delta"
 )
 
+// EnvoyImages are the Envoy versions conformance means: the oldest supported and the newest.
+var EnvoyImages = []string{"envoyproxy/envoy:v1.17-latest", "envoyproxy/envoy:v1.40-latest"}
+
 // Options configure a run.
 type Options struct {
-	// Image is the Envoy image, e.g. "envoyproxy/envoy:v1.40-latest".
-	Image    string
-	Protocol Protocol
 	// New returns a fresh control plane for each test.
 	New func(t *testing.T) ControlPlane
-	// Skip records known deviations: test name to reason.
+	// Protocols the library supports, by default both. Conformance results should say if it's not both.
+	Protocols []Protocol
+	// Skip records known deviations, with a reason. A key is a test's path, or part of it: any of protocol (sotw,
+	// delta), Envoy version (v1.17), mode (normal, rate-limited) and scenario (ChangesWhileDisconnected), joined by "/".
+	// "sotw/ChangesWhileDisconnected" skips that scenario on SotW everywhere.
 	Skip map[string]string
-	// RateLimitedADS rate limits Envoy's requests to the control plane (rate_limit_settings), so it queues them. Delta
-	// Envoy then sends ACKs ahead of its queued subscriptions, so after a reconnect requests arrive in another order.
-	RateLimitedADS bool
+}
+
+// variant is one place in the matrix.
+type variant struct {
+	protocol    Protocol
+	image       string
+	rateLimited bool // rate_limit_settings on Envoy's requests: it queues them, and delta sends ACKs ahead of queued subscriptions
 }
 
 const (
@@ -87,7 +96,9 @@ var (
 	deltaBootstrap []byte
 )
 
-// Run runs the suite as subtests of t. Envoy connects to port 6566 on the host, so don't run it in parallel.
+// Run runs every scenario as subtests of t: on each protocol, on each of EnvoyImages, normally and with Envoy's requests
+// rate limited, e.g. t/sotw/v1.17/rate-limited/StartsEmpty. Envoy connects to port 6566 on the host, so don't run it in
+// parallel.
 func Run(t *testing.T, o Options) {
 	tests := []struct {
 		name string
@@ -100,14 +111,45 @@ func Run(t *testing.T, o Options) {
 		{"Reconnects", reconnects},
 		{"ChangesWhileDisconnected", changesWhileDisconnected},
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if reason, ok := o.Skip[test.name]; ok {
-				t.Skip(reason)
+	protocols := o.Protocols
+	if len(protocols) == 0 {
+		protocols = []Protocol{Sotw, Delta}
+	}
+	for _, protocol := range protocols {
+		t.Run(string(protocol), func(t *testing.T) {
+			for _, image := range EnvoyImages {
+				version := strings.TrimSuffix(image[strings.LastIndex(image, ":")+1:], "-latest")
+				t.Run(version, func(t *testing.T) {
+					for _, rateLimited := range []bool{false, true} {
+						mode := "normal"
+						if rateLimited {
+							mode = "rate-limited"
+						}
+						t.Run(mode, func(t *testing.T) {
+							for _, test := range tests {
+								t.Run(test.name, func(t *testing.T) {
+									if reason, ok := deviation(o.Skip, string(protocol), version, mode, test.name); ok {
+										t.Skip(reason)
+									}
+									test.run(newHarness(t, o, variant{protocol: protocol, image: image, rateLimited: rateLimited}))
+								})
+							}
+						})
+					}
+				})
 			}
-			test.run(newHarness(t, o))
 		})
 	}
+}
+
+// deviation finds a Skip entry whose path parts all match this test's.
+func deviation(skip map[string]string, path ...string) (string, bool) {
+	for key, reason := range skip {
+		if !slices.ContainsFunc(strings.Split(key, "/"), func(part string) bool { return !slices.Contains(path, part) }) {
+			return reason, true
+		}
+	}
+	return "", false
 }
 
 // StartsEmpty: with no config at first, Envoy gets an answer for every type, then takes the first service.
@@ -230,7 +272,7 @@ func changesWhileDisconnected(h *harness) {
 type harness struct {
 	t          *testing.T
 	ctx        context.Context
-	o          Options
+	v          variant
 	cp         ControlPlane
 	rec        *xdstest.Recorder
 	server     *grpc.Server
@@ -238,8 +280,8 @@ type harness struct {
 	checkpoint *xdstest.Checkpoint
 }
 
-func newHarness(t *testing.T, o Options) *harness {
-	h := &harness{t: t, ctx: context.Background(), o: o, cp: o.New(t), rec: &xdstest.Recorder{}}
+func newHarness(t *testing.T, o Options, v variant) *harness {
+	h := &harness{t: t, ctx: context.Background(), v: v, cp: o.New(t), rec: &xdstest.Recorder{}}
 	t.Cleanup(func() {
 		if t.Failed() && h.envoy != nil {
 			log := h.envoy.LogSince(0)
@@ -271,14 +313,14 @@ func (h *harness) start() {
 	go func() { _ = h.server.Serve(lis) }()
 	if h.envoy == nil {
 		bootstrap := sotwBootstrap
-		if h.o.Protocol == Delta {
+		if h.v.protocol == Delta {
 			bootstrap = deltaBootstrap
 		}
-		if h.o.RateLimitedADS {
+		if h.v.rateLimited {
 			bootstrap = rateLimited(h.t, bootstrap)
 		}
 		h.envoy, err = xdstest.StartEnvoy(h.ctx, xdstest.EnvoyConfig{
-			Image: h.o.Image, Bootstrap: bootstrap, ADSPort: adsPort, ListenerPorts: []int{listenerPort}, Args: []string{"-l", "debug"},
+			Image: h.v.image, Bootstrap: bootstrap, ADSPort: adsPort, ListenerPorts: []int{listenerPort}, Args: []string{"-l", "debug"},
 		})
 		h.must(err)
 	}
@@ -300,13 +342,13 @@ func rateLimited(t *testing.T, bootstrap []byte) []byte {
 // anything.
 func (h *harness) assertRateLimitedIfAsked() {
 	h.t.Helper()
-	if !h.o.RateLimitedADS {
+	if !h.v.rateLimited {
 		return
 	}
 	stats, err := h.envoy.Stats(h.ctx)
 	h.must(err)
 	if stats["control_plane.rate_limit_enforced"] == 0 {
-		h.t.Fatal("RateLimitedADS, but Envoy never hit the rate limit")
+		h.t.Fatal("rate limited, but Envoy never hit the rate limit")
 	}
 }
 
@@ -412,7 +454,7 @@ func (h *harness) envoyRejectedSomething() error {
 }
 
 func (h *harness) checks(c *xdstest.Conversation) xdstest.Checks {
-	if h.o.Protocol == Delta {
+	if h.v.protocol == Delta {
 		return xdstest.Delta(c)
 	}
 	return xdstest.Sotw(c)

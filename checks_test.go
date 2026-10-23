@@ -140,3 +140,11 @@ func TestDeltaMakeBeforeBreakAfterAReconnect(t *testing.T) {
 		t.Errorf("without the conversation before, there's nothing to compare with: %v", err)
 	}
 }
+
+func TestSotwNonceEchoedFromThePreviousStream(t *testing.T) {
+	c := NewConversation()
+	c.Add(&discoveryv3.DiscoveryRequest{TypeUrl: CDS, ResponseNonce: "1"}) // Envoy reconnecting, with its last nonce
+	c.Add(&discoveryv3.DiscoveryResponse{TypeUrl: CDS, Nonce: "1"})
+	c.Add(&discoveryv3.DiscoveryRequest{TypeUrl: CDS, ResponseNonce: "1"})
+	wantProblem(t, Sotw(c).AllWereAcked(), "which Envoy had echoed from its previous stream")
+}
