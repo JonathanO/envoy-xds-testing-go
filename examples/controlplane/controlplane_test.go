@@ -1,5 +1,7 @@
 // Tests a control plane the way its own authors would: make a change the way users do, then check the conversation
-// with Envoy, Envoy's health, and traffic. go-control-plane stands in for your control plane.
+// with Envoy, Envoy's health, and traffic. go-control-plane's snapshot cache stands in for your control plane.
+//
+// Run with: go test ./... (needs Docker)
 package controlplane_test
 
 import (
@@ -14,12 +16,15 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	discoveryv3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
+	"github.com/envoyproxy/go-control-plane/pkg/cache/v3"
+	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
+	gcpserver "github.com/envoyproxy/go-control-plane/pkg/server/v3"
 	"google.golang.org/grpc"
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	xdstest "github.com/JonathanO/envoy-xds-testing-go"
-	"github.com/JonathanO/envoy-xds-testing-go/examples"
 )
 
 func TestMovingAServiceToNewEndpoints(t *testing.T) {
@@ -30,13 +35,13 @@ func TestMovingAServiceToNewEndpoints(t *testing.T) {
 
 func movingAServiceToNewEndpoints(t *testing.T, bootstrapFile string, checksFor func(*xdstest.Conversation) xdstest.Checks) {
 	ctx := context.Background()
-	controlPlane := examples.NewGoControlPlane()
-	controlPlane.SetConfig(service("foo", "127.0.0.1"))
+	snapshots := cache.NewSnapshotCache(true, cache.IDHash{}, nil)
+	setService(t, snapshots, "1", "foo", "127.0.0.1")
 
 	// Your server first, then Envoy. The other way round, Envoy backs off and can time out its first fetches.
 	rec := &xdstest.Recorder{}
 	server := grpc.NewServer(grpc.StreamInterceptor(rec.Intercept))
-	controlPlane.Register(server)
+	discoveryv3.RegisterAggregatedDiscoveryServiceServer(server, gcpserver.NewServer(ctx, snapshots, nil))
 	lis, err := net.Listen("tcp", ":6566")
 	must(t, err)
 	go server.Serve(lis)
@@ -65,7 +70,7 @@ func movingAServiceToNewEndpoints(t *testing.T, bootstrapFile string, checksFor 
 
 	// Make a change the way your users would, and wait for it to settle. Envoy's admin port stands in for the
 	// upstream, and every 127/8 address in its container reaches it.
-	controlPlane.SetConfig(service("foo", "127.0.0.2"))
+	setService(t, snapshots, "2", "foo", "127.0.0.2")
 	must(t, xdstest.WaitFor(30*time.Second, xdstest.SettledAfter(c, messageMark, xdstest.Settled(c, xdstest.DefaultQuietPeriod))))
 
 	checks := checksFor(c)
@@ -84,10 +89,11 @@ func movingAServiceToNewEndpoints(t *testing.T, bootstrapFile string, checksFor 
 	}))
 }
 
-// service is a cluster, its endpoint, and a route to it from virtual host name.
-func service(name, address string) []proto.Message {
-	return []proto.Message{
-		&clusterv3.Cluster{
+// setService makes the whole config one service: a cluster, its endpoint, and a route to it from virtual host name.
+func setService(t *testing.T, snapshots cache.SnapshotCache, version, name, address string) {
+	t.Helper()
+	snapshot, err := cache.NewSnapshot(version, map[resourcev3.Type][]types.Resource{
+		resourcev3.ClusterType: {&clusterv3.Cluster{
 			Name:                 name,
 			ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_EDS},
 			ConnectTimeout:       durationpb.New(time.Second),
@@ -95,8 +101,8 @@ func service(name, address string) []proto.Message {
 				ResourceApiVersion:    corev3.ApiVersion_V3,
 				ConfigSourceSpecifier: &corev3.ConfigSource_Ads{Ads: &corev3.AggregatedConfigSource{}},
 			}},
-		},
-		&endpointv3.ClusterLoadAssignment{
+		}},
+		resourcev3.EndpointType: {&endpointv3.ClusterLoadAssignment{
 			ClusterName: name,
 			Endpoints: []*endpointv3.LocalityLbEndpoints{{LbEndpoints: []*endpointv3.LbEndpoint{{
 				HostIdentifier: &endpointv3.LbEndpoint_Endpoint{Endpoint: &endpointv3.Endpoint{Address: &corev3.Address{
@@ -105,16 +111,19 @@ func service(name, address string) []proto.Message {
 					}},
 				}}},
 			}}}},
-		},
-		&routev3.RouteConfiguration{Name: "all_routes", VirtualHosts: []*routev3.VirtualHost{{
+		}},
+		resourcev3.RouteType: {&routev3.RouteConfiguration{Name: "all_routes", VirtualHosts: []*routev3.VirtualHost{{
 			Name:    name,
 			Domains: []string{name},
 			Routes: []*routev3.Route{{
 				Match:  &routev3.RouteMatch{PathSpecifier: &routev3.RouteMatch_Prefix{Prefix: "/"}},
 				Action: &routev3.Route_Route{Route: &routev3.RouteAction{ClusterSpecifier: &routev3.RouteAction_Cluster{Cluster: name}}},
 			}},
-		}}},
-	}
+		}}}},
+	})
+	must(t, err)
+	// testdata's Envoy configs use node id test-envoy-0.
+	must(t, snapshots.SetSnapshot(context.Background(), "test-envoy-0", snapshot))
 }
 
 func must(t *testing.T, err error) {

@@ -225,9 +225,12 @@ Envoy's config uses node id `test-envoy-0` and cluster `test-cluster`, and Envoy
 
 ## Examples
 
-`examples` is a separate module, so the library itself doesn't depend on go-control-plane. Each example starts Envoy in
-Docker on port 6566, so run them one package at a time:
+Each example in `examples` is its own module, with everything it needs, so you can copy one directory and start from
+it; just drop the `replace` line from its `go.mod`. They need Docker. Run one from its directory:
 
 ```sh
-cd examples && go test -p 1 ./...
+cd examples/controlplane && go test ./...
 ```
+
+- [`controlplane`](examples/controlplane): testing your own control plane, as in "A test" above.
+- [`conformance`](examples/conformance): the conformance suite against go-control-plane. It's expected to fail.
