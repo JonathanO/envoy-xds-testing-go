@@ -236,9 +236,10 @@ func TestSotw(t *testing.T) {
 }
 ```
 
-Expect that example to fail: go-control-plane fails most of the suite. It applies a snapshot one type at a time
-without waiting for ACKs, which breaks make before break. In ADS mode it doesn't answer a request for a name it doesn't
-have. And on SotW it sends a rejected cluster again.
+Expect that example to fail: go-control-plane fails most of the suite, and the comment at the top of the example lists
+each failure and why. In short: it applies a snapshot one type at a time without waiting for ACKs, which breaks make
+before break; in ADS mode it doesn't answer a request for a name it doesn't have; and on SotW it sends a rejected
+cluster again.
 
 Implement `Idle() bool` too (`conformance.IdleReporter`) if your library can tell when its latest stream is idle, and
 `Resync()` (`conformance.Resyncer`) if it can make Envoy reconnect.
