@@ -5,7 +5,7 @@ import (
 	"slices"
 
 	discoveryv3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
-	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 )
 
@@ -137,10 +137,27 @@ func (s sotw) SentNoEmptyResponses(fromMessage int) error {
 }
 
 func (s sotw) WasMakeBeforeBreak(fromMessage int) error {
+	return s.WasMakeBeforeBreakAfter(nil, fromMessage)
+}
+
+func (s sotw) WasMakeBeforeBreakAfter(before *Conversation, fromMessage int) error {
 	state := newAckedState()
+	if before != nil {
+		if err := replaySotw(state, before.Messages(), -1); err != nil {
+			return err
+		}
+	}
+	if err := replaySotw(state, s.c.Messages(), fromMessage); err != nil {
+		return err
+	}
+	return state.err()
+}
+
+// replaySotw tracks what Envoy ACKs in messages, checking responses from checkFrom on, or none if it's negative.
+func replaySotw(state *ackedState, messages []proto.Message, checkFrom int) error {
 	pending := map[string]*discoveryv3.DiscoveryResponse{}
 	pendingRemovals := map[string][]string{}
-	for i, m := range s.c.Messages() {
+	for i, m := range messages {
 		switch m := m.(type) {
 		case *discoveryv3.DiscoveryResponse:
 			// CDS is a wildcard type: each response is the full set, so anything Envoy has that's missing is removed.
@@ -160,7 +177,7 @@ func (s sotw) WasMakeBeforeBreak(fromMessage int) error {
 					}
 				}
 			}
-			if i >= fromMessage {
+			if checkFrom >= 0 && i >= checkFrom {
 				if err := state.checkResponse(m.GetTypeUrl(), m.GetResources(), removed); err != nil {
 					return err
 				}
@@ -176,7 +193,7 @@ func (s sotw) WasMakeBeforeBreak(fromMessage int) error {
 			}
 		}
 	}
-	return state.err()
+	return nil
 }
 
 func (s sotw) AnsweredEveryType() error {
@@ -187,17 +204,14 @@ func (s sotw) HadConversationsWith(typeURLs ...string) error {
 	return hadConversationsWith(s.c, typeURLs)
 }
 
-// resourceName is the name Envoy knows a resource by: its name field, or cluster_name for ClusterLoadAssignment.
+// resourceName decodes a resource and returns its NameOf.
 func resourceName(a *anypb.Any) (string, error) {
 	m, err := a.UnmarshalNew()
 	if err != nil {
 		return "", fmt.Errorf("decoding %s: %w", a.GetTypeUrl(), err)
 	}
-	fields := m.ProtoReflect().Descriptor().Fields()
-	for _, name := range []string{"name", "cluster_name"} {
-		if f := fields.ByName(protoreflect.Name(name)); f != nil {
-			return m.ProtoReflect().Get(f).String(), nil
-		}
+	if name := NameOf(m); name != "" {
+		return name, nil
 	}
 	return "", fmt.Errorf("can't work out the name of a %s", a.GetTypeUrl())
 }
