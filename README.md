@@ -242,6 +242,10 @@ have. And on SotW it sends a rejected cluster again.
 
 Implement `Idle() bool` too (`conformance.IdleReporter`) if your library can tell when its latest stream is idle, and
 `Resync()` (`conformance.Resyncer`) if it can make Envoy reconnect.
+
+Set `Options.RateLimitedADS` to rate limit Envoy's requests to the control plane (`rate_limit_settings`). Envoy then
+queues them, and delta Envoy sends ACKs ahead of queued subscriptions, so after a reconnect requests arrive in a
+different order. That's worth one extra run per protocol. The reconnect scenarios check the limit was actually hit.
 The scenarios:
 
 - `StartsEmpty`: no config at first. Envoy gets an answer for every type it asks for, including a route config that
