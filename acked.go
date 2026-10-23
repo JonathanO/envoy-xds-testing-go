@@ -8,8 +8,9 @@ import (
 
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
-	_ "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3" // so resourceName can decode listeners
+	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	"google.golang.org/protobuf/types/known/anypb"
 )
 
@@ -19,11 +20,12 @@ type ackedState struct {
 	edsClusters map[string]bool
 	endpoints   map[string]bool
 	routes      map[string]map[string]bool // clusters used, by route config name
+	listeners   map[string]map[string]bool // route configs used, by listener name
 	problems    []string
 }
 
 func newAckedState() *ackedState {
-	return &ackedState{clusters: map[string]bool{}, edsClusters: map[string]bool{}, endpoints: map[string]bool{}, routes: map[string]map[string]bool{}}
+	return &ackedState{clusters: map[string]bool{}, edsClusters: map[string]bool{}, endpoints: map[string]bool{}, routes: map[string]map[string]bool{}, listeners: map[string]map[string]bool{}}
 }
 
 // checkResponse checks a response before Envoy sees it.
@@ -40,6 +42,13 @@ func (s *ackedState) checkResponse(typeURL string, resources []*anypb.Any, remov
 					s.problems = append(s.problems, fmt.Sprintf("route %q sent using cluster %q before Envoy ACKed the cluster", route.GetName(), c))
 				} else if s.edsClusters[c] && !s.endpoints[c] {
 					s.problems = append(s.problems, fmt.Sprintf("route %q sent using cluster %q before Envoy ACKed its endpoints", route.GetName(), c))
+				}
+			}
+		}
+		for _, r := range removed {
+			for _, name := range sortedKeys(boolKeys(s.listeners)) {
+				if s.listeners[name][r] {
+					s.problems = append(s.problems, fmt.Sprintf("route config %q removed while Envoy's ACKed listener %q still uses it", r, name))
 				}
 			}
 		}
@@ -97,8 +106,55 @@ func (s *ackedState) acked(typeURL string, resources []*anypb.Any, removed []str
 		for _, r := range removed {
 			delete(s.routes, r)
 		}
+	case LDS:
+		for _, a := range resources {
+			listener := &listenerv3.Listener{}
+			if err := a.UnmarshalTo(listener); err != nil {
+				return err
+			}
+			used, err := routeConfigsUsed(listener)
+			if err != nil {
+				return err
+			}
+			s.listeners[listener.GetName()] = used
+		}
+		for _, gone := range removed {
+			// A removed listener drains for a while and keeps its route configs, but serves no new requests: route
+			// configs only it used are now unused.
+			used := s.listeners[gone]
+			delete(s.listeners, gone)
+			for r := range used {
+				stillUsed := false
+				for _, other := range s.listeners {
+					stillUsed = stillUsed || other[r]
+				}
+				if !stillUsed {
+					delete(s.routes, r)
+				}
+			}
+		}
 	}
 	return nil
+}
+
+// routeConfigsUsed are the route configs a listener's HTTP connection managers get by RDS.
+func routeConfigsUsed(listener *listenerv3.Listener) (map[string]bool, error) {
+	used := map[string]bool{}
+	for _, chain := range listener.GetFilterChains() {
+		for _, filter := range chain.GetFilters() {
+			hcm := &hcmv3.HttpConnectionManager{}
+			if filter.GetTypedConfig() == nil || !filter.GetTypedConfig().MessageIs(hcm) {
+				continue
+			}
+			if err := filter.GetTypedConfig().UnmarshalTo(hcm); err != nil {
+				return nil, err
+			}
+			if name := hcm.GetRds().GetRouteConfigName(); name != "" {
+				used[name] = true
+			}
+		}
+	}
+	return used, nil
 }
 
 func (s *ackedState) err() error {

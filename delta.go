@@ -124,8 +124,16 @@ func (d delta) UnsubscribedFrom(typeURL, name string) error {
 }
 
 func (d delta) SentNoEmptyResponses(fromMessage int) error {
-	for _, m := range d.c.Messages()[fromMessage:] {
-		if r, ok := m.(*discoveryv3.DeltaDiscoveryResponse); ok && len(r.GetResources()) == 0 && len(r.GetRemovedResources()) == 0 {
+	answered := map[string]bool{}
+	for i, m := range d.c.Messages() {
+		r, ok := m.(*discoveryv3.DeltaDiscoveryResponse)
+		if !ok {
+			continue
+		}
+		// A type's first answer may be empty: it tells Envoy there's nothing yet.
+		first := !answered[r.GetTypeUrl()]
+		answered[r.GetTypeUrl()] = true
+		if !first && i >= fromMessage && len(r.GetResources()) == 0 && len(r.GetRemovedResources()) == 0 {
 			return fmt.Errorf("sent empty response %q for %s", r.GetNonce(), r.GetTypeUrl())
 		}
 	}
@@ -167,6 +175,12 @@ func replayDelta(state *ackedState, messages []proto.Message, checkFrom int) err
 					return err
 				}
 				delete(pending, m.GetResponseNonce())
+			}
+			if m.GetErrorDetail() == nil {
+				// Envoy drops what it unsubscribes from, e.g. a route config once no listener uses it.
+				if err := state.acked(m.GetTypeUrl(), nil, m.GetResourceNamesUnsubscribe()); err != nil {
+					return err
+				}
 			}
 		}
 	}
