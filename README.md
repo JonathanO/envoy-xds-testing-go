@@ -204,8 +204,8 @@ conversation before it: Envoy keeps its config across the disconnect, so make be
 Package `conformance` checks the layer that serves config to Envoy: given desired config, does a real Envoy get there
 safely? It doesn't test how a control plane decides what to serve. For that, write your own scenarios as above.
 
-Implement `conformance.ControlPlane` for your library, and run it once per Envoy version and protocol. Here it is for
-go-control-plane; [`examples/conformance`](examples/conformance/conformance_test.go) is the runnable version.
+Implement `conformance.ControlPlane` for your library, and call `conformance.Run` once. Here it is for go-control-plane;
+[`examples/conformance`](examples/conformance/conformance_test.go) is the runnable version.
 
 ```go
 type goControlPlane struct {
@@ -224,10 +224,8 @@ func (g *goControlPlane) SetConfig(resources []proto.Message) {
 	g.cache.SetSnapshot(context.Background(), "test-envoy-0", snapshot)
 }
 
-func TestSotw(t *testing.T) {
+func TestConformance(t *testing.T) {
 	conformance.Run(t, conformance.Options{
-		Image:    "envoyproxy/envoy:v1.40-latest",
-		Protocol: conformance.Sotw,
 		New: func(*testing.T) conformance.ControlPlane {
 			c := cache.NewSnapshotCache(true, cache.IDHash{}, nil)
 			return &goControlPlane{cache: c, server: server.NewServer(context.Background(), c, nil)}
@@ -244,10 +242,15 @@ cluster again.
 Implement `Idle() bool` too (`conformance.IdleReporter`) if your library can tell when its latest stream is idle, and
 `Resync()` (`conformance.Resyncer`) if it can make Envoy reconnect.
 
-Set `Options.RateLimitedADS` to rate limit Envoy's requests to the control plane (`rate_limit_settings`). Envoy then
-queues them, and delta Envoy sends ACKs ahead of queued subscriptions, so after a reconnect requests arrive in a
-different order. That's worth one extra run per protocol. The reconnect scenarios check the limit was actually hit.
-The scenarios:
+The suite owns the matrix, so every library is tested the same way. It runs every scenario:
+- on both protocols, unless `Options.Protocols` narrows it for a library that only does one;
+- on each of `conformance.EnvoyImages`, the oldest supported Envoy (1.17) and the newest;
+- normally, and with Envoy's requests to the control plane rate limited (`rate_limit_settings`). Envoy then queues
+  them, and delta Envoy sends ACKs ahead of queued subscriptions, so after a reconnect requests arrive in a different
+  order. The reconnect scenarios check the limit was actually hit.
+
+That's 48 subtests and takes a few minutes, so run it in CI or before a release rather than on every build. Subtests
+are named by their path, e.g. `TestConformance/sotw/v1.17/rate-limited/StartsEmpty`. The scenarios:
 
 - `StartsEmpty`: no config at first. Envoy gets an answer for every type it asks for, including a route config that
   doesn't exist yet, then takes the first service.
@@ -264,7 +267,8 @@ The scenarios:
 
 After each change, the suite checks that the conversation stayed sane. Every response was ACKed, nothing was sent
 unasked, there were no empty responses, and changes were make before break. It also checks that Envoy is healthy and
-logged no warnings. To record a known deviation, add the test's name to `Skip`, with the reason.
+logged no warnings. To record a known deviation, add it to `Options.Skip`, with the reason. Keys are parts of a test's
+path, so `"sotw/ChangesWhileDisconnected"` skips that scenario on SotW, on every version and mode.
 
 Envoy's config uses node id `test-envoy-0` and cluster `test-cluster`, and Envoy connects to port 6566 on the host.
 
