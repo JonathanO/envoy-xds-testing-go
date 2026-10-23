@@ -162,6 +162,34 @@ func (e *Envoy) HTTPStatus(ctx context.Context, listenerPort int, virtualHost st
 	return resp.StatusCode, nil
 }
 
+// RoutedVia checks that GET / with this Host header through one of Envoy's listeners answers 200 and went to this
+// cluster, going by its upstream_rq_total. A 200 alone doesn't say which cluster answered. It retries for up to 5
+// seconds, while Envoy's workers catch up with an ACKed change.
+func (e *Envoy) RoutedVia(ctx context.Context, listenerPort int, virtualHost, cluster string) error {
+	requests := "cluster." + cluster + ".upstream_rq_total"
+	return WaitFor(5*time.Second, func() error {
+		before, err := e.Stats(ctx)
+		if err != nil {
+			return err
+		}
+		status, err := e.HTTPStatus(ctx, listenerPort, virtualHost)
+		if err != nil {
+			return err
+		}
+		if status != http.StatusOK {
+			return fmt.Errorf("%s: status %d, want 200", virtualHost, status)
+		}
+		after, err := e.Stats(ctx)
+		if err != nil {
+			return err
+		}
+		if after[requests] <= before[requests] {
+			return fmt.Errorf("%s: request didn't go to cluster %s (%s stayed at %d)", virtualHost, cluster, requests, after[requests])
+		}
+		return nil
+	})
+}
+
 // Stats returns Envoy's counters and gauges by name.
 func (e *Envoy) Stats(ctx context.Context) (map[string]uint64, error) {
 	body, err := e.admin(ctx, "/stats")

@@ -31,6 +31,9 @@ What's in it:
 - `Settled`, `SettledIdle`, `SettledAfter`: conditions to wait on until your control plane and Envoy have stopped
   talking.
 - `WaitFor(timeout, check)`: polls a check until it passes.
+- `Checkpoint`: marks a conversation, Envoy's log and its stats, and checks everything since in one call.
+- `Envoy.RoutedVia`: a request answers 200 and went to the cluster you expect.
+- Package `match`: composable matchers for resources, messages, the order things happened in, and what Envoy holds.
 - Package `conformance`: the conformance suite.
 
 Every check returns an `error` rather than taking a `*testing.T`, so it works with `WaitFor` and with whatever
@@ -90,24 +93,15 @@ func TestAddsAService(t *testing.T) {
 	must(t, xdstest.WaitFor(10*time.Second, func() error { return xdstest.Sotw(c).HadConversationsWith(xdstest.CDS) }))
 	must(t, xdstest.WaitFor(10*time.Second, xdstest.Sotw(c).AnsweredEveryType))
 	must(t, xdstest.WaitFor(30*time.Second, xdstest.Settled(c, xdstest.DefaultQuietPeriod)))
-	messageMark, logMark := c.Size(), envoy.LogSize()
+	checkpoint, err := xdstest.TakeCheckpoint(ctx, envoy, c)
+	must(t, err)
 
 	// Make a change the way your users would, and wait for it to settle.
 	controlPlane.AddService("foo", "127.0.0.1:9901")
-	must(t, xdstest.WaitFor(30*time.Second, xdstest.SettledAfter(c, messageMark, xdstest.Settled(c, xdstest.DefaultQuietPeriod))))
+	must(t, xdstest.WaitFor(30*time.Second, xdstest.SettledAfter(c, checkpoint.Message, xdstest.Settled(c, xdstest.DefaultQuietPeriod))))
 
-	checks := xdstest.Sotw(c)
-	must(t, checks.NothingSentUnasked(false))
-	must(t, checks.AllWereAcked())
-	must(t, checks.SentNoEmptyResponses(messageMark))
-	must(t, checks.WasMakeBeforeBreak(messageMark))
-	must(t, envoy.Healthy(ctx, nil))
-	must(t, envoy.WarningsSince(logMark))
-	status, err := envoy.HTTPStatus(ctx, 10000, "foo")
-	must(t, err)
-	if status != 200 {
-		t.Errorf("status %d", status)
-	}
+	must(t, checkpoint.Sane(ctx)) // the conversation, and Envoy's health and log, since the checkpoint
+	must(t, envoy.RoutedVia(ctx, 10000, "foo", "foo"))
 }
 
 func must(t *testing.T, err error) {
@@ -118,7 +112,8 @@ func must(t *testing.T, err error) {
 }
 ```
 
-For delta xDS, use `xdstest.Delta(c)` and set `api_type: DELTA_GRPC` in Envoy's config.
+For delta xDS, use `xdstest.Delta(c)` and set `api_type: DELTA_GRPC` in Envoy's config. `Checkpoint` and
+`xdstest.ChecksFor(c)` work out which protocol a conversation uses.
 
 ### Waiting for things to settle
 
@@ -128,6 +123,15 @@ either way for the quiet period. After a change, wrap either one in `SettledAfte
 waiting, the control plane may not have begun sending the change yet, and look idle.
 
 ### What the checks mean
+
+- `TakeCheckpoint(ctx, envoy, c)`: marks the conversation, Envoy's log and its stats, so later checks only look at what
+  happened since. Take one once Envoy has synced, and again after anything you did on purpose that Envoy warns about,
+  like a disconnect or a NACK.
+  - `Sane(ctx)`: all of the conversation checks below from the checkpoint on, then `EnvoyHealthy`.
+  - `SaneAfterReconnect(ctx, before)`: the same for a conversation Envoy started by reconnecting. It allows Envoy before
+    1.19 resending wildcard names. Given `before`, the conversation before it, it checks make before break from where
+    Envoy left off; with nil, it skips that.
+  - `EnvoyHealthy(ctx)`: `Envoy.Healthy` and `Envoy.WarningsSince`, both since the checkpoint.
 
 - `NothingSentUnasked`: every response is for a type, and resource names, that Envoy subscribed to.
 - `AllWereAcked`: Envoy ACKed every response, and NACKed none.
@@ -143,6 +147,40 @@ waiting, the control plane may not have begun sending the change yet, and look i
   initial fetches since the baseline. Pass nil, or after a deliberate NACK, a `Stats` taken after it.
 - `Envoy.WarningsSince(mark)`: no warnings or errors in Envoy's log since the mark. Take the mark after startup, and
   again after anything you did on purpose that Envoy warns about, like a disconnect.
+- `Envoy.RoutedVia(ctx, listenerPort, virtualHost, cluster)`: a request to the virtual host answers 200 and went to that
+  cluster, going by its `upstream_rq_total`. A 200 alone doesn't say which cluster answered.
+- `WasMakeBeforeBreakAfter(before, from)`: make before break on a conversation Envoy started by reconnecting, starting
+  from what it last ACKed on `before`. Envoy keeps its config across a disconnect.
+
+### Matchers
+
+Package `match` has matchers for your own expectations. Message matchers work the same for SotW and delta.
+
+```go
+// Envoy ACKed routes that no longer use bar before bar's cluster was removed.
+err := match.InOrder(c,
+	match.AckOf(match.Response(xdstest.RDS, match.Containing(match.RouteConfig(match.Not(match.RoutingTo("bar")))))),
+	match.Response(xdstest.CDS, match.Removing("bar")))
+
+// Wait for Envoy to reject something.
+err = xdstest.WaitFor(10*time.Second, func() error {
+	return match.HasMessage(c, match.Nack(xdstest.CDS, match.WithMessage("connect_timeout")))
+})
+
+// What Envoy holds.
+dump, err := envoy.ConfigDump(ctx, "")
+names, err := match.ActiveClusterNames(dump)
+err = match.HasRouteConfig(dump, match.Routing("foo", "foo-v2"))
+```
+
+- Resources: `Cluster(...)`, `RouteConfig(...)`, `EndpointAssignment(...)`, with `Named`, `ClusterType`, `RoutingTo`,
+  `Routing(virtualHost, cluster)` and `WithEndpoint(address, port)`.
+- Messages: `Response(typeURL, ...)`, `Request(typeURL, ...)` and `Nack(typeURL, ...)` (`""` for any type), with
+  `Containing`, `Removing`, `SubscribingTo`, `UnsubscribingFrom` (delta only) and `WithMessage`. For SotW, `Removing`
+  matches a wildcard (CDS, LDS) response without the resource.
+- Conversations: `HasMessage`, and `InOrder` with `AckOf`, Envoy's ACK of a matching response.
+- Envoy: `ActiveClusters`, `ActiveClusterNames`, `HasActiveCluster` and `HasRouteConfig` on a config dump.
+- `Not`, `AllOf` and `AnyOf` combine matchers, and `New` makes your own.
 
 For anything else, look at what Envoy has: `envoy.ConfigDump(ctx, "?resource=dynamic_active_clusters")`, or
 `envoy.Stats(ctx)`. Decoding a config dump needs every type in it linked in, so blank import the go-control-plane
@@ -151,16 +189,15 @@ packages for any extensions your config uses beyond the HTTP connection manager 
 ### Reconnects
 
 To test a reconnect, stop your gRPC server and start a new one on the same port, with the same control plane and
-`Recorder`. Envoy then opens a second conversation. On that one, skip `WasMakeBeforeBreak`, because the checks can't
-know what config Envoy kept. Envoy before 1.19 resends resource names for wildcard types when it reconnects, so use
-`NothingSentUnasked(true)` there.
+`Recorder`. Envoy then opens a second conversation. Check it with `SaneAfterReconnect(ctx, before)`, passing the
+conversation before it: Envoy keeps its config across the disconnect, so make before break carries on from there.
 
 ### Things to know
 
 - Each Envoy start costs a few seconds, and the first, which pulls the image, much more. Add checks to the scenarios
   you have before adding new scenarios.
 - Envoy connects to a fixed port, so don't run these tests in parallel.
-- Take marks from `LogSize()` and `Size()`. Then checks only look at what happened since.
+- Take a `Checkpoint` after Envoy has synced. Then checks only look at what happened since.
 
 ## Conformance suite for xDS libraries
 
@@ -216,6 +253,9 @@ The scenarios:
   `conformance.Resyncer`, a fixed config must get through after `Resync()`.
 - `Reconnects`: a service is removed while Envoy is disconnected. After it reconnects, traffic still flows and updates
   still work.
+- `ChangesWhileDisconnected`: a route moves to a new cluster, and the old cluster is removed, while Envoy is
+  disconnected. Envoy keeps its config across the disconnect, so after it reconnects the move must be make before break
+  from there.
 
 After each change, the suite checks that the conversation stayed sane. Every response was ACKed, nothing was sent
 unasked, there were no empty responses, and changes were make before break. It also checks that Envoy is healthy and

@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -82,8 +81,6 @@ var (
 	sotwBootstrap []byte
 	//go:embed envoy-delta.yaml
 	deltaBootstrap []byte
-
-	minorVersion = regexp.MustCompile(`:v1\.(\d+)`)
 )
 
 // Run runs the suite as subtests of t. Envoy connects to port 6566 on the host, so don't run it in parallel.
@@ -97,6 +94,7 @@ func Run(t *testing.T, o Options) {
 		{"MovesRouteToNewCluster", movesRouteToNewCluster},
 		{"ContainsRejectedConfig", containsRejectedConfig},
 		{"Reconnects", reconnects},
+		{"ChangesWhileDisconnected", changesWhileDisconnected},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -113,10 +111,10 @@ func startsEmpty(h *harness) {
 	h.cp.SetConfig(nil)
 	h.start()
 	c := h.synced(1)
-	h.assertSettled(c, false)
+	h.must(h.checkpoint.Sane(h.ctx))
 
 	h.change(c, services("foo"))
-	h.assertSettled(c, false)
+	h.must(h.checkpoint.Sane(h.ctx))
 	h.assertStatus("foo", 200)
 }
 
@@ -127,14 +125,14 @@ func addsAndRemovesServices(h *harness) {
 	c := h.synced(1)
 
 	h.change(c, services("foo", "bar"))
-	h.assertSettled(c, false)
+	h.must(h.checkpoint.Sane(h.ctx))
 	h.assertStatus("bar", 200)
 
 	h.change(c, services("foo"))
 	// Envoy drops its EDS subscription for bar, which needs no response.
 	h.must(xdstest.WaitFor(10*time.Second, func() error { return h.checks(c).UnsubscribedFrom(xdstest.EDS, "bar") }))
 	h.must(xdstest.WaitFor(10*time.Second, h.settled(c)))
-	h.assertSettled(c, false)
+	h.must(h.checkpoint.Sane(h.ctx))
 	h.assertStatus("bar", 404)
 	h.assertStatus("foo", 200)
 }
@@ -144,11 +142,11 @@ func movesRouteToNewCluster(h *harness) {
 	h.cp.SetConfig(service("foo", "foo-v1"))
 	h.start()
 	c := h.synced(1)
-	h.assertStatus("foo", 200)
+	h.must(h.envoy.RoutedVia(h.ctx, listenerPort, "foo", "foo-v1"))
 
 	h.change(c, service("foo", "foo-v2"))
-	h.assertSettled(c, false)
-	h.assertStatus("foo", 200)
+	h.must(h.checkpoint.Sane(h.ctx))
+	h.must(h.envoy.RoutedVia(h.ctx, listenerPort, "foo", "foo-v2"))
 }
 
 // ContainsRejectedConfig: Envoy rejects a bad cluster, and the library contains it. It doesn't send the bad cluster
@@ -163,23 +161,21 @@ func containsRejectedConfig(h *harness) {
 
 	h.cp.SetConfig(withBadCluster(services("foo")))
 	h.must(xdstest.WaitFor(10*time.Second, h.envoyRejectedSomething))
-	h.logMark = h.envoy.LogSize()
-	stats, err := h.envoy.Stats(h.ctx)
+	afterNack, err := xdstest.TakeCheckpoint(h.ctx, h.envoy, h.rec.Conversations()[0])
 	h.must(err)
-	h.statsMark = stats
 
+	contained := func() error { return h.contained(afterNack) }
 	h.cp.SetConfig(withBadCluster(services("foo", "bar"))) // still bad
-	h.must(holdsFor(2*time.Second, h.contained))
+	h.must(holdsFor(2*time.Second, contained))
 	h.cp.SetConfig(services("foo", "bar")) // fixed
-	h.must(holdsFor(2*time.Second, h.contained))
+	h.must(holdsFor(2*time.Second, contained))
 	h.assertStatus("foo", 200)
-	h.must(h.envoy.Healthy(h.ctx, h.statsMark))
-	h.must(h.envoy.WarningsSince(h.logMark))
+	h.must(afterNack.EnvoyHealthy(h.ctx))
 
 	if r, ok := h.cp.(Resyncer); ok {
 		r.Resync()
-		c := h.synced(2)
-		h.assertSettled(c, true)
+		h.synced(2)
+		h.must(h.checkpoint.SaneAfterReconnect(h.ctx, nil))
 		h.assertStatus("bar", 200)
 	}
 }
@@ -196,26 +192,40 @@ func reconnects(h *harness) {
 	h.cp.SetConfig(services("foo"))
 	h.start()
 	c := h.synced(2) // ignores Envoy's warnings about the disconnect
-	h.assertSettled(c, true)
+	h.must(h.checkpoint.SaneAfterReconnect(h.ctx, nil))
 	h.assertStatus("foo", 200)
 	h.assertStatus("bar", 404)
 
 	h.change(c, services("foo", "baz"))
-	h.assertSettled(c, true)
+	h.must(h.checkpoint.SaneAfterReconnect(h.ctx, nil))
 	h.assertStatus("baz", 200)
 }
 
+// ChangesWhileDisconnected: a route moved to a new cluster, and the old cluster removed, while Envoy was away. Envoy
+// keeps its config across the disconnect, so once it reconnects the move must be make before break from there.
+func changesWhileDisconnected(h *harness) {
+	h.cp.SetConfig(service("foo", "foo-v1"))
+	h.start()
+	before := h.synced(1)
+	h.must(h.envoy.RoutedVia(h.ctx, listenerPort, "foo", "foo-v1"))
+
+	h.stopServer()
+	h.cp.SetConfig(service("foo", "foo-v2"))
+	h.start()
+	h.synced(2)
+	h.must(h.checkpoint.SaneAfterReconnect(h.ctx, before))
+	h.must(h.envoy.RoutedVia(h.ctx, listenerPort, "foo", "foo-v2"))
+}
+
 type harness struct {
-	t         *testing.T
-	ctx       context.Context
-	o         Options
-	cp        ControlPlane
-	rec       *xdstest.Recorder
-	server    *grpc.Server
-	envoy     *xdstest.Envoy
-	logMark   int
-	msgMark   int
-	statsMark map[string]uint64
+	t          *testing.T
+	ctx        context.Context
+	o          Options
+	cp         ControlPlane
+	rec        *xdstest.Recorder
+	server     *grpc.Server
+	envoy      *xdstest.Envoy
+	checkpoint *xdstest.Checkpoint
 }
 
 func newHarness(t *testing.T, o Options) *harness {
@@ -283,8 +293,9 @@ func (h *harness) synced(nth int) *xdstest.Conversation {
 		return errors.Join(h.checks(c).HadConversationsWith(xdstest.CDS, xdstest.RDS), h.checks(c).AnsweredEveryType())
 	}))
 	h.must(xdstest.WaitFor(30*time.Second, h.settled(c)))
-	h.logMark = h.envoy.LogSize()
-	h.msgMark = c.Size()
+	cp, err := xdstest.TakeCheckpoint(h.ctx, h.envoy, c)
+	h.must(err)
+	h.checkpoint = cp
 	return c
 }
 
@@ -302,22 +313,6 @@ func (h *harness) settled(c *xdstest.Conversation) func() error {
 	return xdstest.Settled(c, xdstest.DefaultQuietPeriod)
 }
 
-// assertSettled checks everything we expect once settled: a sane conversation, and a healthy Envoy that logged no
-// warnings since synced(). After a reconnect we don't know what config Envoy kept, so make before break can't be
-// checked.
-func (h *harness) assertSettled(c *xdstest.Conversation, reconnected bool) {
-	h.t.Helper()
-	checks := h.checks(c)
-	h.must(checks.NothingSentUnasked(reconnected && h.brokenWildcardReconnect()))
-	h.must(checks.AllWereAcked())
-	h.must(checks.SentNoEmptyResponses(h.msgMark))
-	if !reconnected {
-		h.must(checks.WasMakeBeforeBreak(h.msgMark))
-	}
-	h.must(h.envoy.Healthy(h.ctx, h.statsMark))
-	h.must(h.envoy.WarningsSince(h.logMark))
-}
-
 func (h *harness) assertStatus(virtualHost string, want int) {
 	h.t.Helper()
 	// Envoy ACKs once its main thread has the config; workers get it a moment later.
@@ -331,7 +326,7 @@ func (h *harness) assertStatus(virtualHost string, want int) {
 }
 
 // contained checks that there have been no rejections since the first NACK, and no reconnects.
-func (h *harness) contained() error {
+func (h *harness) contained(afterNack *xdstest.Checkpoint) error {
 	if n := len(h.rec.Conversations()); n != 1 {
 		return fmt.Errorf("%d streams; dropping Envoy after a NACK makes it reconnect in a loop", n)
 	}
@@ -340,8 +335,8 @@ func (h *harness) contained() error {
 		return err
 	}
 	for name, value := range stats {
-		if strings.HasSuffix(name, ".update_rejected") && value != h.statsMark[name] {
-			return fmt.Errorf("%s rose by %d since the first NACK; the bad cluster was sent again", name, value-h.statsMark[name])
+		if strings.HasSuffix(name, ".update_rejected") && value != afterNack.Stats[name] {
+			return fmt.Errorf("%s rose by %d since the first NACK; the bad cluster was sent again", name, value-afterNack.Stats[name])
 		}
 	}
 	return nil
@@ -382,16 +377,6 @@ func (h *harness) checks(c *xdstest.Conversation) xdstest.Checks {
 		return xdstest.Delta(c)
 	}
 	return xdstest.Sotw(c)
-}
-
-// brokenWildcardReconnect: before 1.19 Envoy resent resource names for wildcard types on reconnect.
-func (h *harness) brokenWildcardReconnect() bool {
-	m := minorVersion.FindStringSubmatch(h.o.Image)
-	if m == nil {
-		return false
-	}
-	minor, _ := strconv.Atoi(m[1])
-	return minor < 19
 }
 
 // services is one service per name: a cluster and endpoints of that name, and a virtual host of that name routing
