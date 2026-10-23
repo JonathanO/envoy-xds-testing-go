@@ -1,9 +1,16 @@
-// Runs the conformance suite against upstream go-control-plane. Expect it to fail: on Envoy 1.40 with go-control-plane
-// v0.14.0, only Reconnects passes on SotW, and Reconnects and ContainsRejectedConfig on delta.
+// Runs the conformance suite against upstream go-control-plane. Expect it to fail. On Envoy 1.40 with go-control-plane
+// v0.14.0:
 //
-// go-control-plane applies each snapshot one type at a time, in a fixed order, without waiting for Envoy to ACK, so it
-// isn't make before break. In ADS mode it won't answer a request for a name that isn't in the snapshot. And on SotW it
-// sends a rejected cluster again.
+//   - StartsEmpty, both: on SotW, the route to foo is sent before Envoy ACKs foo (not make before break). On delta, the
+//     route config Envoy asks for doesn't exist yet, and in ADS mode it never answers.
+//   - AddsAndRemovesServices, both: the route to bar is sent before Envoy ACKs bar.
+//   - MovesRouteToNewCluster, both: foo-v1 is removed while the route still uses it, and the route to foo-v2 is sent
+//     before Envoy ACKs foo-v2.
+//   - ContainsRejectedConfig, SotW only: the rejected cluster is sent again, and Envoy keeps rejecting it.
+//   - ChangesWhileDisconnected, both: the same as MovesRouteToNewCluster, after Envoy reconnects.
+//
+// Reconnects passes on both, and ContainsRejectedConfig on delta. The make before break failures are all one cause:
+// go-control-plane sends each snapshot one type at a time, in a fixed order, without waiting for Envoy's ACKs.
 //
 // Run with: go test ./... (needs Docker)
 package conformance_test
