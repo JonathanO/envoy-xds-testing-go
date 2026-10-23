@@ -133,9 +133,17 @@ func (s sotw) UnsubscribedFrom(typeURL, name string) error {
 }
 
 func (s sotw) SentNoEmptyResponses(fromMessage int) error {
-	for _, m := range s.c.Messages()[fromMessage:] {
+	answered := map[string]bool{}
+	for i, m := range s.c.Messages() {
+		r, ok := m.(*discoveryv3.DiscoveryResponse)
+		if !ok {
+			continue
+		}
+		// A type's first answer may be empty: it tells Envoy there's nothing yet.
+		first := !answered[r.GetTypeUrl()]
+		answered[r.GetTypeUrl()] = true
 		// An empty response is meaningful for wildcard types: it removes everything.
-		if r, ok := m.(*discoveryv3.DiscoveryResponse); ok && len(r.GetResources()) == 0 && !IsWildcard(r.GetTypeUrl()) {
+		if !first && i >= fromMessage && len(r.GetResources()) == 0 && !IsWildcard(r.GetTypeUrl()) {
 			return fmt.Errorf("sent empty response %q for %s", r.GetNonce(), r.GetTypeUrl())
 		}
 	}
@@ -163,12 +171,17 @@ func (s sotw) WasMakeBeforeBreakAfter(before *Conversation, fromMessage int) err
 func replaySotw(state *ackedState, messages []proto.Message, checkFrom int) error {
 	pending := map[string]*discoveryv3.DiscoveryResponse{}
 	pendingRemovals := map[string][]string{}
+	subscribed := map[string][]string{} // names, by non-wildcard type
 	for i, m := range messages {
 		switch m := m.(type) {
 		case *discoveryv3.DiscoveryResponse:
-			// CDS is a wildcard type: each response is the full set, so anything Envoy has that's missing is removed.
+			// CDS and LDS are wildcard types: each response is the full set, so anything Envoy has that's missing is removed.
 			var removed []string
-			if m.GetTypeUrl() == CDS {
+			if m.GetTypeUrl() == CDS || m.GetTypeUrl() == LDS {
+				had := state.clusters
+				if m.GetTypeUrl() == LDS {
+					had = boolKeys(state.listeners)
+				}
 				sent := map[string]bool{}
 				for _, r := range m.GetResources() {
 					name, err := resourceName(r)
@@ -177,7 +190,7 @@ func replaySotw(state *ackedState, messages []proto.Message, checkFrom int) erro
 					}
 					sent[name] = true
 				}
-				for c := range state.clusters {
+				for c := range had {
 					if !sent[c] {
 						removed = append(removed, c)
 					}
@@ -196,6 +209,19 @@ func replaySotw(state *ackedState, messages []proto.Message, checkFrom int) erro
 					return err
 				}
 				delete(pending, m.GetResponseNonce())
+			}
+			if m.GetErrorDetail() == nil && !IsWildcard(m.GetTypeUrl()) {
+				// Envoy drops what it stops asking for, e.g. a route config once no listener uses it.
+				var dropped []string
+				for _, name := range subscribed[m.GetTypeUrl()] {
+					if !slices.Contains(m.GetResourceNames(), name) {
+						dropped = append(dropped, name)
+					}
+				}
+				subscribed[m.GetTypeUrl()] = m.GetResourceNames()
+				if err := state.acked(m.GetTypeUrl(), nil, dropped); err != nil {
+					return err
+				}
 			}
 		}
 	}
