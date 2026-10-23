@@ -10,6 +10,7 @@ uses. There are two ways to use it:
   config correctly.
 
 This is a Go port of `envoy-xds-testing` from [java-envoy-xds](https://github.com/JonathanO/java-envoy-xds).
+[`examples/`](examples) has both, working against upstream go-control-plane.
 
 ## Setup
 
@@ -52,6 +53,9 @@ To give Envoy an upstream to send traffic to, use its own admin port. Every `127
 container reaches it, and `GET /` answers 200.
 
 ### A test
+
+[`examples/controlplane`](examples/controlplane/controlplane_test.go) is this test, runnable, with go-control-plane
+standing in for your control plane, for SotW and delta.
 
 ```go
 func TestAddsAService(t *testing.T) {
@@ -163,35 +167,42 @@ know what config Envoy kept. Envoy before 1.19 resends resource names for wildca
 Package `conformance` checks the layer that serves config to Envoy: given desired config, does a real Envoy get there
 safely? It doesn't test how a control plane decides what to serve. For that, write your own scenarios as above.
 
-Implement `conformance.ControlPlane` for your library, and run it once per Envoy version and protocol:
+Implement `conformance.ControlPlane` for your library, and run it once per Envoy version and protocol. Here it is for
+go-control-plane; [`examples/conformance`](examples/conformance/conformance_test.go) is the runnable version.
 
 ```go
-type myLibrary struct{ cache *mylib.Cache }
+type goControlPlane struct {
+	cache   cache.SnapshotCache
+	server  server.Server
+	version atomic.Int64
+}
 
-func (m *myLibrary) Register(s *grpc.Server) {
-	discoveryv3.RegisterAggregatedDiscoveryServiceServer(s, mylib.NewServer(m.cache))
+func (g *goControlPlane) Register(s *grpc.Server) {
+	discoveryv3.RegisterAggregatedDiscoveryServiceServer(s, g.server)
 }
 
 // SetConfig replaces the whole desired config: Clusters, ClusterLoadAssignments and RouteConfigurations.
-func (m *myLibrary) SetConfig(resources []proto.Message) {
-	m.cache.ReplaceAll(resources)
+func (g *goControlPlane) SetConfig(resources []proto.Message) {
+	// Group resources by type into a cache.NewSnapshot, with an entry for every type even if empty, then:
+	g.cache.SetSnapshot(context.Background(), "test-envoy-0", snapshot)
 }
 
-func TestConformance(t *testing.T) {
-	for _, image := range []string{"envoyproxy/envoy:v1.17-latest", "envoyproxy/envoy:v1.40-latest"} {
-		for _, protocol := range []conformance.Protocol{conformance.Sotw, conformance.Delta} {
-			t.Run(image+"/"+string(protocol), func(t *testing.T) {
-				conformance.Run(t, conformance.Options{
-					Image:    image,
-					Protocol: protocol,
-					New:      func(t *testing.T) conformance.ControlPlane { return &myLibrary{cache: mylib.NewCache()} },
-					Skip:     map[string]string{"ContainsRejectedConfig": "known bug: ..."},
-				})
-			})
-		}
-	}
+func TestSotw(t *testing.T) {
+	conformance.Run(t, conformance.Options{
+		Image:    "envoyproxy/envoy:v1.40-latest",
+		Protocol: conformance.Sotw,
+		New: func(*testing.T) conformance.ControlPlane {
+			c := cache.NewSnapshotCache(true, cache.IDHash{}, nil)
+			return &goControlPlane{cache: c, server: server.NewServer(context.Background(), c, nil)}
+		},
+		Skip: map[string]string{"ContainsRejectedConfig": "sends the rejected cluster again"},
+	})
 }
 ```
+
+go-control-plane fails most of the suite, so the example records what it fails in `Skip`. It applies a snapshot
+one type at a time without waiting for ACKs, which breaks make before break. In ADS mode it doesn't answer a request
+for a name it doesn't have. And on SotW it sends a rejected cluster again.
 
 Implement `Idle() bool` too (`conformance.IdleReporter`) if your library can tell when its latest stream is idle, and
 `Resync()` (`conformance.Resyncer`) if it can make Envoy reconnect.
@@ -212,3 +223,12 @@ unasked, there were no empty responses, and changes were make before break. It a
 logged no warnings. To record a known deviation, add the test's name to `Skip`, with the reason.
 
 Envoy's config uses node id `test-envoy-0` and cluster `test-cluster`, and Envoy connects to port 6566 on the host.
+
+## Examples
+
+`examples` is a separate module, so the library itself doesn't depend on go-control-plane. Each example starts Envoy in
+Docker on port 6566, so run them one package at a time:
+
+```sh
+cd examples && go test -p 1 ./...
+```
