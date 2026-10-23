@@ -46,6 +46,12 @@ type IdleReporter interface {
 	Idle() bool
 }
 
+// Resyncer is optional for a ControlPlane.
+type Resyncer interface {
+	// Resync makes Envoy drop its stream and sync from scratch, e.g. to get a fixed config to an Envoy that NACKed.
+	Resync()
+}
+
 // Protocol is the ADS flavour Envoy uses.
 type Protocol string
 
@@ -89,7 +95,7 @@ func Run(t *testing.T, o Options) {
 		{"StartsEmpty", startsEmpty},
 		{"AddsAndRemovesServices", addsAndRemovesServices},
 		{"MovesRouteToNewCluster", movesRouteToNewCluster},
-		{"RecoversFromRejectedConfig", recoversFromRejectedConfig},
+		{"ContainsRejectedConfig", containsRejectedConfig},
 		{"Reconnects", reconnects},
 	}
 	for _, test := range tests {
@@ -145,29 +151,37 @@ func movesRouteToNewCluster(h *harness) {
 	h.assertStatus("foo", 200)
 }
 
-// RecoversFromRejectedConfig: Envoy rejects a bad cluster; the next good config still gets through on the same stream.
-func recoversFromRejectedConfig(h *harness) {
+// ContainsRejectedConfig: Envoy rejects a bad cluster, and the library contains it. It doesn't send the bad cluster
+// again, not even as part of a later change, and doesn't drop Envoy into a reconnect loop: retrying is spam, and Envoy
+// resets its reconnect backoff whenever it gets a response. Envoy keeps serving its last good config. Whether a later
+// fix gets through on the same stream is up to the library, but if it's a Resyncer, the fix must get through after
+// a Resync.
+func containsRejectedConfig(h *harness) {
 	h.cp.SetConfig(services("foo"))
 	h.start()
 	h.synced(1)
 
-	bad := cluster("bad")
-	bad.ConnectTimeout = &durationpb.Duration{Seconds: -1}
-	h.cp.SetConfig(append(services("foo"), bad))
+	h.cp.SetConfig(withBadCluster(services("foo")))
 	h.must(xdstest.WaitFor(10*time.Second, h.envoyRejectedSomething))
 	h.logMark = h.envoy.LogSize()
 	stats, err := h.envoy.Stats(h.ctx)
 	h.must(err)
 	h.statsMark = stats
 
-	h.cp.SetConfig(services("foo", "bar"))
-	h.assertStatus("bar", 200)
-	if n := len(h.rec.Conversations()); n != 1 {
-		h.t.Fatalf("%d streams; the control plane shouldn't drop Envoy for a NACK", n)
-	}
-	h.must(xdstest.WaitFor(10*time.Second, h.settled(h.rec.Conversations()[0])))
+	h.cp.SetConfig(withBadCluster(services("foo", "bar"))) // still bad
+	h.must(holdsFor(2*time.Second, h.contained))
+	h.cp.SetConfig(services("foo", "bar")) // fixed
+	h.must(holdsFor(2*time.Second, h.contained))
+	h.assertStatus("foo", 200)
 	h.must(h.envoy.Healthy(h.ctx, h.statsMark))
 	h.must(h.envoy.WarningsSince(h.logMark))
+
+	if r, ok := h.cp.(Resyncer); ok {
+		r.Resync()
+		c := h.synced(2)
+		h.assertSettled(c, true)
+		h.assertStatus("bar", 200)
+	}
 }
 
 // Reconnects: Envoy reconnects after a service was removed while it was away. Traffic keeps flowing and updates still
@@ -316,6 +330,35 @@ func (h *harness) assertStatus(virtualHost string, want int) {
 	}))
 }
 
+// contained checks that there have been no rejections since the first NACK, and no reconnects.
+func (h *harness) contained() error {
+	if n := len(h.rec.Conversations()); n != 1 {
+		return fmt.Errorf("%d streams; dropping Envoy after a NACK makes it reconnect in a loop", n)
+	}
+	stats, err := h.envoy.Stats(h.ctx)
+	if err != nil {
+		return err
+	}
+	for name, value := range stats {
+		if strings.HasSuffix(name, ".update_rejected") && value != h.statsMark[name] {
+			return fmt.Errorf("%s rose by %d since the first NACK; the bad cluster was sent again", name, value-h.statsMark[name])
+		}
+	}
+	return nil
+}
+
+// holdsFor fails as soon as check does, or passes once it has held for d.
+func holdsFor(d time.Duration, check func() error) error {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if err := check(); err != nil {
+			return err
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return nil
+}
+
 func (h *harness) envoyRejectedSomething() error {
 	for _, c := range h.rec.Conversations() {
 		for _, m := range c.Messages() {
@@ -361,6 +404,12 @@ func services(names ...string) []proto.Message {
 		rc.VirtualHosts = append(rc.VirtualHosts, virtualHost(name, name))
 	}
 	return append(config, rc)
+}
+
+func withBadCluster(config []proto.Message) []proto.Message {
+	bad := cluster("bad")
+	bad.ConnectTimeout = &durationpb.Duration{Seconds: -1}
+	return append(append([]proto.Message(nil), config...), bad)
 }
 
 // service is a single virtual host routing to a cluster of a different name.
