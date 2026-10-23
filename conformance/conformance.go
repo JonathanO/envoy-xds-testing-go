@@ -20,10 +20,14 @@ import (
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	routerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
+	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	discoveryv3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	xdstest "github.com/JonathanO/envoy-xds-testing-go"
@@ -61,8 +65,8 @@ const (
 	Delta Protocol = "delta"
 )
 
-// EnvoyImages are the Envoy versions conformance means: the oldest supported and the newest.
-var EnvoyImages = []string{"envoyproxy/envoy:v1.17-latest", "envoyproxy/envoy:v1.40-latest"}
+// EnvoyImages are the Envoy versions conformance means: the oldest Envoy release upstream still supports, and the newest.
+var EnvoyImages = []string{"envoyproxy/envoy:v1.36-latest", "envoyproxy/envoy:v1.40-latest"}
 
 // Options configure a run.
 type Options struct {
@@ -71,7 +75,7 @@ type Options struct {
 	// Protocols the library supports, by default both. Conformance results should say if it's not both.
 	Protocols []Protocol
 	// Skip records known deviations, with a reason. A key is a test's path, or part of it: any of protocol (sotw,
-	// delta), Envoy version (v1.17), mode (normal, rate-limited) and scenario (ChangesWhileDisconnected), joined by "/".
+	// delta), Envoy version (v1.36), mode (normal, rate-limited) and scenario (ChangesWhileDisconnected), joined by "/".
 	// "sotw/ChangesWhileDisconnected" skips that scenario on SotW everywhere.
 	Skip map[string]string
 }
@@ -84,9 +88,10 @@ type variant struct {
 }
 
 const (
-	adsPort      = 6566
-	listenerPort = 10000
-	routes       = "all_routes" // Envoy's static listener asks for this
+	adsPort             = 6566
+	listenerPort        = 10000
+	dynamicListenerPort = 10001        // the listener AddsAndRemovesListener adds
+	routes              = "all_routes" // Envoy's static listener asks for this
 )
 
 var (
@@ -97,7 +102,7 @@ var (
 )
 
 // Run runs every scenario as subtests of t: on each protocol, on each of EnvoyImages, normally and with Envoy's requests
-// rate limited, e.g. t/sotw/v1.17/rate-limited/StartsEmpty. Envoy connects to port 6566 on the host, so don't run it in
+// rate limited, e.g. t/sotw/v1.36/rate-limited/StartsEmpty. Envoy connects to port 6566 on the host, so don't run it in
 // parallel.
 func Run(t *testing.T, o Options) {
 	tests := []struct {
@@ -110,6 +115,9 @@ func Run(t *testing.T, o Options) {
 		{"ContainsRejectedConfig", containsRejectedConfig},
 		{"Reconnects", reconnects},
 		{"ChangesWhileDisconnected", changesWhileDisconnected},
+		{"AddsAndRemovesListener", addsAndRemovesListener},
+		{"Churns", churns},
+		{"ControlPlaneRestarts", controlPlaneRestarts},
 	}
 	protocols := o.Protocols
 	if len(protocols) == 0 {
@@ -170,9 +178,11 @@ func addsAndRemovesServices(h *harness) {
 	h.start()
 	c := h.synced(1)
 
-	h.change(c, services("foo", "bar"))
+	// empty has no endpoints: it still needs an answer, an empty assignment, or Envoy leaves it warming
+	h.change(c, withEmptyCluster(services("foo", "bar")))
 	h.must(h.checkpoint.Sane(h.ctx))
 	h.assertStatus("bar", 200)
+	h.assertStatus("empty", 503)
 
 	h.change(c, services("foo"))
 	// Envoy drops its EDS subscription for bar, which needs no response.
@@ -269,11 +279,86 @@ func changesWhileDisconnected(h *harness) {
 	}))
 }
 
+// AddsAndRemovesListener: a listener, its route config, cluster and endpoints added in one change, then removed in one
+// change. The listener mustn't be left warming, and a route config mustn't go while a listener Envoy has still uses it.
+func addsAndRemovesListener(h *harness) {
+	h.cp.SetConfig(services("foo"))
+	h.start()
+	c := h.synced(1)
+
+	h.change(c, withListener(services("foo")))
+	h.must(h.checkpoint.Sane(h.ctx))
+	h.must(h.envoy.RoutedVia(h.ctx, dynamicListenerPort, "dynamic", "dynamic"))
+
+	h.change(c, services("foo"))
+	h.must(xdstest.WaitFor(10*time.Second, h.settled(c)))
+	h.must(h.checkpoint.Sane(h.ctx))
+	h.must(xdstest.WaitFor(10*time.Second, func() error { // just the static listener
+		stats, err := h.envoy.Stats(h.ctx)
+		if err == nil && stats["listener_manager.total_listeners_active"] != 1 {
+			err = fmt.Errorf("%d active listeners, want 1", stats["listener_manager.total_listeners_active"])
+		}
+		return err
+	}))
+	h.assertStatus("foo", 200)
+}
+
+// Churns: twenty changes in quick succession, each moving foo to a new cluster. Envoy ends on the last, safely.
+func churns(h *harness) {
+	h.cp.SetConfig(service("foo", "foo-v0"))
+	h.start()
+	c := h.synced(1)
+
+	for i := 1; i <= 20; i++ {
+		h.cp.SetConfig(service("foo", fmt.Sprintf("foo-v%d", i)))
+		time.Sleep(25 * time.Millisecond) // so some changes arrive while others are on their way
+	}
+	h.must(xdstest.WaitFor(60*time.Second, xdstest.SettledAfter(c, h.checkpoint.Message, h.settled(c))))
+	h.must(h.checkpoint.Sane(h.ctx))
+	h.must(h.envoy.RoutedVia(h.ctx, listenerPort, "foo", "foo-v20"))
+	h.must(xdstest.WaitFor(60*time.Second, func() error {
+		dump, err := h.envoy.ConfigDump(h.ctx, "?resource=dynamic_active_clusters")
+		if err != nil {
+			return err
+		}
+		names, err := match.ActiveClusterNames(dump)
+		if err == nil && !slices.Equal(names, []string{"foo-v20"}) {
+			err = fmt.Errorf("active clusters %v, want just foo-v20: no stale clusters left", names)
+		}
+		return err
+	}))
+}
+
+// ControlPlaneRestarts: Envoy reconnects to a control plane that restarted, with different config. Envoy kept its
+// config, which the new control plane never sent, so it can only go by what Envoy tells it. Traffic keeps flowing, and
+// bar goes once nothing uses it.
+func controlPlaneRestarts(h *harness) {
+	h.cp.SetConfig(services("foo", "bar"))
+	h.start()
+	before := h.synced(1)
+	h.assertStatus("bar", 200)
+
+	h.stopServer()
+	h.cp = h.newCP(h.t)
+	h.cp.SetConfig(services("foo", "baz"))
+	h.start()
+	h.synced(2)
+	h.assertRateLimitedIfAsked()
+	h.must(h.checkpoint.SaneAfterReconnect(h.ctx, before))
+	h.assertStatus("foo", 200)
+	h.assertStatus("baz", 200)
+	h.assertStatus("bar", 404)
+	h.must(xdstest.WaitFor(10*time.Second, func() error {
+		return match.InOrder(h.rec.Conversations()[1], match.AckOf(match.Response(xdstest.CDS, match.Removing("bar"))))
+	}))
+}
+
 type harness struct {
 	t          *testing.T
 	ctx        context.Context
 	v          variant
 	cp         ControlPlane
+	newCP      func(*testing.T) ControlPlane
 	rec        *xdstest.Recorder
 	server     *grpc.Server
 	envoy      *xdstest.Envoy
@@ -281,7 +366,7 @@ type harness struct {
 }
 
 func newHarness(t *testing.T, o Options, v variant) *harness {
-	h := &harness{t: t, ctx: context.Background(), v: v, cp: o.New(t), rec: &xdstest.Recorder{}}
+	h := &harness{t: t, ctx: context.Background(), v: v, cp: o.New(t), newCP: o.New, rec: &xdstest.Recorder{}}
 	t.Cleanup(func() {
 		if t.Failed() && h.envoy != nil {
 			log := h.envoy.LogSince(0)
@@ -320,7 +405,7 @@ func (h *harness) start() {
 			bootstrap = rateLimited(h.t, bootstrap)
 		}
 		h.envoy, err = xdstest.StartEnvoy(h.ctx, xdstest.EnvoyConfig{
-			Image: h.v.image, Bootstrap: bootstrap, ADSPort: adsPort, ListenerPorts: []int{listenerPort}, Args: []string{"-l", "debug"},
+			Image: h.v.image, Bootstrap: bootstrap, ADSPort: adsPort, ListenerPorts: []int{listenerPort, dynamicListenerPort}, Args: []string{"-l", "debug"},
 		})
 		h.must(err)
 	}
@@ -371,7 +456,7 @@ func (h *harness) synced(nth int) *xdstest.Conversation {
 	}))
 	c := h.rec.Conversations()[nth-1]
 	h.must(xdstest.WaitFor(10*time.Second, func() error {
-		return errors.Join(h.checks(c).HadConversationsWith(xdstest.CDS, xdstest.RDS), h.checks(c).AnsweredEveryType())
+		return errors.Join(h.checks(c).HadConversationsWith(xdstest.CDS, xdstest.LDS, xdstest.RDS), h.checks(c).AnsweredEveryType())
 	}))
 	h.must(xdstest.WaitFor(30*time.Second, h.settled(c)))
 	cp, err := xdstest.TakeCheckpoint(h.ctx, h.envoy, c)
@@ -476,6 +561,46 @@ func withBadCluster(config []proto.Message) []proto.Message {
 	bad := cluster("bad")
 	bad.ConnectTimeout = &durationpb.Duration{Seconds: -1}
 	return append(append([]proto.Message(nil), config...), bad)
+}
+
+// withEmptyCluster adds cluster empty, with no endpoints, and a virtual host empty routing to it.
+func withEmptyCluster(config []proto.Message) []proto.Message {
+	var withEmpty []proto.Message
+	for _, m := range config {
+		if r, ok := m.(*routev3.RouteConfiguration); ok && r.GetName() == routes {
+			r = proto.Clone(r).(*routev3.RouteConfiguration)
+			r.VirtualHosts = append(r.VirtualHosts, virtualHost("empty", "empty"))
+			m = r
+		}
+		withEmpty = append(withEmpty, m)
+	}
+	return append(withEmpty, cluster("empty"), &endpointv3.ClusterLoadAssignment{ClusterName: "empty"})
+}
+
+// withListener adds listener dynamic on port 10001, getting route config dynamic by RDS, whose virtual host dynamic
+// routes to cluster dynamic.
+func withListener(config []proto.Message) []proto.Message {
+	router, _ := anypb.New(&routerv3.Router{})
+	hcm, _ := anypb.New(&hcmv3.HttpConnectionManager{
+		StatPrefix: "dynamic",
+		RouteSpecifier: &hcmv3.HttpConnectionManager_Rds{Rds: &hcmv3.Rds{RouteConfigName: "dynamic", ConfigSource: &corev3.ConfigSource{
+			ResourceApiVersion:    corev3.ApiVersion_V3,
+			ConfigSourceSpecifier: &corev3.ConfigSource_Ads{Ads: &corev3.AggregatedConfigSource{}},
+		}}},
+		HttpFilters: []*hcmv3.HttpFilter{{Name: "envoy.filters.http.router", ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: router}}},
+	})
+	listener := &listenerv3.Listener{
+		Name: "dynamic",
+		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{SocketAddress: &corev3.SocketAddress{
+			Address: "0.0.0.0", PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: dynamicListenerPort},
+		}}},
+		FilterChains: []*listenerv3.FilterChain{{Filters: []*listenerv3.Filter{{
+			Name: "envoy.filters.network.http_connection_manager", ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: hcm},
+		}}}},
+	}
+	return append(append([]proto.Message(nil), config...), listener,
+		&routev3.RouteConfiguration{Name: "dynamic", VirtualHosts: []*routev3.VirtualHost{virtualHost("dynamic", "dynamic")}},
+		cluster("dynamic"), endpoints("dynamic"))
 }
 
 // service is a single virtual host routing to a cluster of a different name.

@@ -1,19 +1,21 @@
 // Runs the conformance suite against upstream go-control-plane. Expect it to fail. With go-control-plane v0.14.0, on
-// both protocols, Envoy 1.17 and 1.40, normal and rate limited:
+// both protocols, Envoy 1.36 and 1.40, normal and rate limited:
 //
 //   - StartsEmpty fails everywhere. On SotW, the route to foo is sent before Envoy ACKs foo (not make before break).
 //     On delta, the route config Envoy asks for doesn't exist yet, and in ADS mode it never answers.
-//   - AddsAndRemovesServices fails everywhere: the route to bar is sent before Envoy ACKs bar.
+//   - AddsAndRemovesServices fails everywhere: the routes to bar and empty are sent before Envoy ACKs their clusters.
 //   - MovesRouteToNewCluster fails everywhere: foo-v1 is removed while the route still uses it, and the route to
 //     foo-v2 is sent before Envoy ACKs foo-v2.
+//   - AddsAndRemovesListener fails everywhere: the listener's route config is sent before Envoy ACKs its cluster.
+//   - Churns fails everywhere: as MovesRouteToNewCluster, many times over.
 //   - ContainsRejectedConfig fails on SotW: the rejected cluster is sent again, and Envoy keeps rejecting it. It passes
 //     on delta.
-//   - Reconnects passes only on Envoy 1.40, SotW in both modes and delta normal. On SotW with Envoy 1.17, a response
-//     reuses a nonce Envoy echoed from its previous stream, because go-control-plane numbers nonces from 1 on each
-//     stream. On delta with Envoy 1.17, baz isn't routable 5 seconds after it's added. On delta rate limited, it
-//     never answers EDS after the reconnect.
-//   - ChangesWhileDisconnected fails everywhere: as MovesRouteToNewCluster, after Envoy reconnects. On SotW with Envoy
-//     1.17, the nonce reuse shows first.
+//   - Reconnects fails on delta rate limited: it never answers EDS after the reconnect. It passes everywhere else.
+//   - ChangesWhileDisconnected fails everywhere: as MovesRouteToNewCluster, after Envoy reconnects.
+//   - ControlPlaneRestarts fails everywhere. On delta, bar is removed while the route Envoy kept still uses it. On
+//     SotW, it never answers LDS: this example numbers snapshot versions from 1 in each control plane, so the new one's
+//     version matches the one Envoy kept, and go-control-plane takes Envoy to be up to date. Versions that differ
+//     across restarts, e.g. hashes of the config, avoid that.
 //
 // The make before break failures are all one cause: go-control-plane sends each snapshot one type at a time, in a
 // fixed order, without waiting for Envoy's ACKs.
@@ -29,6 +31,7 @@ import (
 
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	discoveryv3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
@@ -63,13 +66,15 @@ func (g *goControlPlane) Register(s *grpc.Server) {
 
 func (g *goControlPlane) SetConfig(resources []proto.Message) {
 	// Every type needs an entry, even an empty one, or go-control-plane never answers Envoy's request for it.
-	byType := map[resourcev3.Type][]types.Resource{resourcev3.ClusterType: nil, resourcev3.EndpointType: nil, resourcev3.RouteType: nil}
+	byType := map[resourcev3.Type][]types.Resource{resourcev3.ClusterType: nil, resourcev3.EndpointType: nil, resourcev3.ListenerType: nil, resourcev3.RouteType: nil}
 	for _, r := range resources {
 		switch r.(type) {
 		case *clusterv3.Cluster:
 			byType[resourcev3.ClusterType] = append(byType[resourcev3.ClusterType], r)
 		case *endpointv3.ClusterLoadAssignment:
 			byType[resourcev3.EndpointType] = append(byType[resourcev3.EndpointType], r)
+		case *listenerv3.Listener:
+			byType[resourcev3.ListenerType] = append(byType[resourcev3.ListenerType], r)
 		case *routev3.RouteConfiguration:
 			byType[resourcev3.RouteType] = append(byType[resourcev3.RouteType], r)
 		}
