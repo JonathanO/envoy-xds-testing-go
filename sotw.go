@@ -169,13 +169,14 @@ func (s sotw) WasMakeBeforeBreakAfter(before *Conversation, fromMessage int) err
 
 // replaySotw tracks what Envoy ACKs in messages, checking responses from checkFrom on, or none if it's negative.
 func replaySotw(state *ackedState, messages []proto.Message, checkFrom int) error {
+	// By "type nonce": Envoy keeps nonces per type, so another type's ACK may reuse one.
 	pending := map[string]*discoveryv3.DiscoveryResponse{}
 	pendingRemovals := map[string][]string{}
 	subscribed := map[string][]string{} // names, by non-wildcard type
 	for i, m := range messages {
 		switch m := m.(type) {
 		case *discoveryv3.DiscoveryResponse:
-			// CDS and LDS are wildcard types: each response is the full set, so anything Envoy has that's missing is removed.
+			// LDS, CDS and SRDS are wildcard types: each response is the full set, so anything Envoy has that's missing is removed.
 			var removed []string
 			if m.GetTypeUrl() == CDS || m.GetTypeUrl() == LDS {
 				had := state.clusters
@@ -201,14 +202,15 @@ func replaySotw(state *ackedState, messages []proto.Message, checkFrom int) erro
 					return err
 				}
 			}
-			pending[m.GetNonce()] = m
-			pendingRemovals[m.GetNonce()] = removed
+			pending[m.GetTypeUrl()+" "+m.GetNonce()] = m
+			pendingRemovals[m.GetTypeUrl()+" "+m.GetNonce()] = removed
 		case *discoveryv3.DiscoveryRequest:
-			if acked, ok := pending[m.GetResponseNonce()]; ok && m.GetErrorDetail() == nil {
-				if err := state.acked(acked.GetTypeUrl(), acked.GetResources(), pendingRemovals[m.GetResponseNonce()]); err != nil {
+			key := m.GetTypeUrl() + " " + m.GetResponseNonce()
+			if acked, ok := pending[key]; ok && m.GetErrorDetail() == nil {
+				if err := state.acked(acked.GetTypeUrl(), acked.GetResources(), pendingRemovals[key]); err != nil {
 					return err
 				}
-				delete(pending, m.GetResponseNonce())
+				delete(pending, key)
 			}
 			if m.GetErrorDetail() == nil && !IsWildcard(m.GetTypeUrl()) {
 				// Envoy drops what it stops asking for, e.g. a route config once no listener uses it.

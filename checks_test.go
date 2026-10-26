@@ -32,17 +32,21 @@ func routeTo(clusters ...string) *routev3.RouteConfiguration {
 	return &routev3.RouteConfiguration{Name: "routes", VirtualHosts: []*routev3.VirtualHost{vh}}
 }
 
-// sotwExchange is a SotW response and Envoy's ACK of it.
-func sotwExchange(t *testing.T, c *Conversation, typeURL, nonce string, resources ...proto.Message) {
+func sotwResponse(t *testing.T, c *Conversation, typeURL, nonce string, resources ...proto.Message) {
 	r := &discoveryv3.DiscoveryResponse{TypeUrl: typeURL, Nonce: nonce}
 	for _, m := range resources {
 		r.Resources = append(r.Resources, anyOf(t, m))
 	}
 	c.Add(r)
+}
+
+// sotwExchange is a SotW response and Envoy's ACK of it.
+func sotwExchange(t *testing.T, c *Conversation, typeURL, nonce string, resources ...proto.Message) {
+	sotwResponse(t, c, typeURL, nonce, resources...)
 	c.Add(&discoveryv3.DiscoveryRequest{TypeUrl: typeURL, ResponseNonce: nonce})
 }
 
-func deltaExchange(t *testing.T, c *Conversation, typeURL, nonce string, removed []string, resources ...proto.Message) {
+func deltaResponse(t *testing.T, c *Conversation, typeURL, nonce string, removed []string, resources ...proto.Message) {
 	r := &discoveryv3.DeltaDiscoveryResponse{TypeUrl: typeURL, Nonce: nonce, RemovedResources: removed}
 	for _, m := range resources {
 		name, err := resourceName(anyOf(t, m))
@@ -52,6 +56,10 @@ func deltaExchange(t *testing.T, c *Conversation, typeURL, nonce string, removed
 		r.Resources = append(r.Resources, &discoveryv3.Resource{Name: name, Resource: anyOf(t, m)})
 	}
 	c.Add(r)
+}
+
+func deltaExchange(t *testing.T, c *Conversation, typeURL, nonce string, removed []string, resources ...proto.Message) {
+	deltaResponse(t, c, typeURL, nonce, removed, resources...)
 	c.Add(&discoveryv3.DeltaDiscoveryRequest{TypeUrl: typeURL, ResponseNonce: nonce})
 }
 
@@ -147,4 +155,77 @@ func TestSotwNonceEchoedFromThePreviousStream(t *testing.T) {
 	c.Add(&discoveryv3.DiscoveryResponse{TypeUrl: CDS, Nonce: "1"})
 	c.Add(&discoveryv3.DiscoveryRequest{TypeUrl: CDS, ResponseNonce: "1"})
 	wantProblem(t, Sotw(c).AllWereAcked(), "which Envoy had echoed from its previous stream")
+}
+
+func TestWildcardTypesAreTheOnesEnvoySubscribesToWithAWildcard(t *testing.T) {
+	// The xDS docs name only LDS and CDS, but Envoy's SRDS subscription also starts with no names:
+	// source/common/router/scoped_rds.h, subscription_->start({}).
+	for _, typeURL := range []string{LDS, RDS, SRDS, VHDS, CDS, EDS, SDS, RTDS} {
+		if want := typeURL == LDS || typeURL == CDS || typeURL == SRDS; IsWildcard(typeURL) != want {
+			t.Errorf("IsWildcard(%s) = %v, want %v", typeURL, !want, want)
+		}
+	}
+}
+
+func TestMakeBeforeBreakFindsEndpointsUnderTheClustersEdsServiceName(t *testing.T) {
+	cluster := edsCluster("v1")
+	cluster.EdsClusterConfig = &clusterv3.Cluster_EdsClusterConfig{ServiceName: "v1-endpoints"}
+	endpoints := &endpointv3.ClusterLoadAssignment{ClusterName: "v1-endpoints"}
+
+	c := NewConversation()
+	sotwExchange(t, c, CDS, "1", cluster)
+	sotwExchange(t, c, EDS, "2", endpoints)
+	sotwExchange(t, c, RDS, "3", routeTo("v1"))
+	if err := Sotw(c).WasMakeBeforeBreak(0); err != nil {
+		t.Error(err)
+	}
+
+	c = NewConversation()
+	deltaExchange(t, c, CDS, "1", nil, cluster)
+	deltaExchange(t, c, EDS, "2", nil, endpoints)
+	deltaExchange(t, c, RDS, "3", nil, routeTo("v1"))
+	if err := Delta(c).WasMakeBeforeBreak(0); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestSotwMakeBeforeBreakDoesNotTakeAnAckOfAnotherTypesNonce(t *testing.T) {
+	// Envoy keeps SotW nonces per type, so EDS's ACK of its nonce 2 isn't CDS's.
+	c := NewConversation()
+	sotwExchange(t, c, CDS, "1", edsCluster("a"))
+	sotwExchange(t, c, EDS, "1", &endpointv3.ClusterLoadAssignment{ClusterName: "a"})
+	sotwResponse(t, c, EDS, "2", &endpointv3.ClusterLoadAssignment{ClusterName: "a"})
+	sotwResponse(t, c, CDS, "2", edsCluster("a"), &clusterv3.Cluster{Name: "b"})
+	c.Add(&discoveryv3.DiscoveryRequest{TypeUrl: EDS, ResponseNonce: "2"})
+	sotwResponse(t, c, RDS, "1", routeTo("b"))
+	c.Add(&discoveryv3.DiscoveryRequest{TypeUrl: CDS, ResponseNonce: "2"})
+	c.Add(&discoveryv3.DiscoveryRequest{TypeUrl: RDS, ResponseNonce: "1"})
+	if err := Sotw(c).AllWereAcked(); err != nil {
+		t.Error(err)
+	}
+	wantProblem(t, Sotw(c).WasMakeBeforeBreak(0), `route "routes" sent using cluster "b" before Envoy ACKed the cluster`)
+}
+
+func TestDeltaAllWereAckedCatchesANonceReusedAfterItsAck(t *testing.T) {
+	c := NewConversation()
+	deltaExchange(t, c, CDS, "1", nil, edsCluster("a"))
+	deltaExchange(t, c, CDS, "1", []string{"a"})
+	wantProblem(t, Delta(c).AllWereAcked(), `sent nonce "1" for `+CDS+` more than once`)
+}
+
+func TestDeltaDoesNotTakeAnAckOfAnotherTypesNonce(t *testing.T) {
+	// Envoy keeps nonces per type, so EDS's ACK of its nonce 2 isn't CDS's.
+	c := NewConversation()
+	deltaExchange(t, c, CDS, "1", nil, edsCluster("a"))
+	deltaExchange(t, c, EDS, "1", nil, &endpointv3.ClusterLoadAssignment{ClusterName: "a"})
+	deltaResponse(t, c, EDS, "2", nil, &endpointv3.ClusterLoadAssignment{ClusterName: "a"})
+	deltaResponse(t, c, CDS, "2", nil, &clusterv3.Cluster{Name: "b"})
+	c.Add(&discoveryv3.DeltaDiscoveryRequest{TypeUrl: EDS, ResponseNonce: "2"})
+	deltaResponse(t, c, RDS, "1", nil, routeTo("b"))
+	c.Add(&discoveryv3.DeltaDiscoveryRequest{TypeUrl: CDS, ResponseNonce: "2"})
+	c.Add(&discoveryv3.DeltaDiscoveryRequest{TypeUrl: RDS, ResponseNonce: "1"})
+	if err := Delta(c).AllWereAcked(); err != nil {
+		t.Error(err)
+	}
+	wantProblem(t, Delta(c).WasMakeBeforeBreak(0), `route "routes" sent using cluster "b" before Envoy ACKed the cluster`)
 }

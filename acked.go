@@ -1,6 +1,7 @@
 package xdstest
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"sort"
@@ -17,7 +18,7 @@ import (
 // ackedState tracks what Envoy has ACKed, to check each new response against it for make before break.
 type ackedState struct {
 	clusters    map[string]bool
-	edsClusters map[string]bool
+	edsClusters map[string]string // the name their endpoints are under, by cluster
 	endpoints   map[string]bool
 	routes      map[string]map[string]bool // clusters used, by route config name
 	listeners   map[string]map[string]bool // route configs used, by listener name
@@ -25,7 +26,7 @@ type ackedState struct {
 }
 
 func newAckedState() *ackedState {
-	return &ackedState{clusters: map[string]bool{}, edsClusters: map[string]bool{}, endpoints: map[string]bool{}, routes: map[string]map[string]bool{}, listeners: map[string]map[string]bool{}}
+	return &ackedState{clusters: map[string]bool{}, edsClusters: map[string]string{}, endpoints: map[string]bool{}, routes: map[string]map[string]bool{}, listeners: map[string]map[string]bool{}}
 }
 
 // checkResponse checks a response before Envoy sees it.
@@ -40,7 +41,7 @@ func (s *ackedState) checkResponse(typeURL string, resources []*anypb.Any, remov
 			for _, c := range sortedKeys(referencedClusters(route)) {
 				if !s.clusters[c] {
 					s.problems = append(s.problems, fmt.Sprintf("route %q sent using cluster %q before Envoy ACKed the cluster", route.GetName(), c))
-				} else if s.edsClusters[c] && !s.endpoints[c] {
+				} else if edsName, ok := s.edsClusters[c]; ok && !s.endpoints[edsName] {
 					s.problems = append(s.problems, fmt.Sprintf("route %q sent using cluster %q before Envoy ACKed its endpoints", route.GetName(), c))
 				}
 			}
@@ -75,7 +76,7 @@ func (s *ackedState) acked(typeURL string, resources []*anypb.Any, removed []str
 			}
 			s.clusters[cluster.GetName()] = true
 			if cluster.GetType() == clusterv3.Cluster_EDS {
-				s.edsClusters[cluster.GetName()] = true
+				s.edsClusters[cluster.GetName()] = cmp.Or(cluster.GetEdsClusterConfig().GetServiceName(), cluster.GetName())
 			} else {
 				delete(s.edsClusters, cluster.GetName())
 			}
