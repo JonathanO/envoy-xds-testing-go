@@ -46,7 +46,7 @@ func sotwExchange(t *testing.T, c *Conversation, typeURL, nonce string, resource
 	c.Add(&discoveryv3.DiscoveryRequest{TypeUrl: typeURL, ResponseNonce: nonce})
 }
 
-func deltaExchange(t *testing.T, c *Conversation, typeURL, nonce string, removed []string, resources ...proto.Message) {
+func deltaResponse(t *testing.T, c *Conversation, typeURL, nonce string, removed []string, resources ...proto.Message) {
 	r := &discoveryv3.DeltaDiscoveryResponse{TypeUrl: typeURL, Nonce: nonce, RemovedResources: removed}
 	for _, m := range resources {
 		name, err := resourceName(anyOf(t, m))
@@ -56,6 +56,10 @@ func deltaExchange(t *testing.T, c *Conversation, typeURL, nonce string, removed
 		r.Resources = append(r.Resources, &discoveryv3.Resource{Name: name, Resource: anyOf(t, m)})
 	}
 	c.Add(r)
+}
+
+func deltaExchange(t *testing.T, c *Conversation, typeURL, nonce string, removed []string, resources ...proto.Message) {
+	deltaResponse(t, c, typeURL, nonce, removed, resources...)
 	c.Add(&discoveryv3.DeltaDiscoveryRequest{TypeUrl: typeURL, ResponseNonce: nonce})
 }
 
@@ -206,5 +210,22 @@ func TestDeltaAllWereAckedCatchesANonceReusedAfterItsAck(t *testing.T) {
 	c := NewConversation()
 	deltaExchange(t, c, CDS, "1", nil, edsCluster("a"))
 	deltaExchange(t, c, CDS, "1", []string{"a"})
-	wantProblem(t, Delta(c).AllWereAcked(), `sent nonce "1" more than once`)
+	wantProblem(t, Delta(c).AllWereAcked(), `sent nonce "1" for `+CDS+` more than once`)
+}
+
+func TestDeltaDoesNotTakeAnAckOfAnotherTypesNonce(t *testing.T) {
+	// Envoy keeps nonces per type, so EDS's ACK of its nonce 2 isn't CDS's.
+	c := NewConversation()
+	deltaExchange(t, c, CDS, "1", nil, edsCluster("a"))
+	deltaExchange(t, c, EDS, "1", nil, &endpointv3.ClusterLoadAssignment{ClusterName: "a"})
+	deltaResponse(t, c, EDS, "2", nil, &endpointv3.ClusterLoadAssignment{ClusterName: "a"})
+	deltaResponse(t, c, CDS, "2", nil, &clusterv3.Cluster{Name: "b"})
+	c.Add(&discoveryv3.DeltaDiscoveryRequest{TypeUrl: EDS, ResponseNonce: "2"})
+	deltaResponse(t, c, RDS, "1", nil, routeTo("b"))
+	c.Add(&discoveryv3.DeltaDiscoveryRequest{TypeUrl: CDS, ResponseNonce: "2"})
+	c.Add(&discoveryv3.DeltaDiscoveryRequest{TypeUrl: RDS, ResponseNonce: "1"})
+	if err := Delta(c).AllWereAcked(); err != nil {
+		t.Error(err)
+	}
+	wantProblem(t, Delta(c).WasMakeBeforeBreak(0), `route "routes" sent using cluster "b" before Envoy ACKed the cluster`)
 }

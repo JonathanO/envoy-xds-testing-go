@@ -19,32 +19,35 @@ type delta struct {
 }
 
 func (d delta) AllWereAcked() error {
+	// By "type nonce": Envoy keeps nonces per type, so a library may number them per type.
 	sent := map[string]bool{}
 	outstanding := map[string]bool{}
 	for _, m := range d.c.Messages() {
 		switch m := m.(type) {
 		case *discoveryv3.DeltaDiscoveryRequest:
 			if nonce := m.GetResponseNonce(); nonce != "" {
-				if !outstanding[nonce] {
-					return fmt.Errorf("unexpected response nonce %q, expected one of %v", nonce, sortedKeys(outstanding))
+				key := m.GetTypeUrl() + " " + nonce
+				if !outstanding[key] {
+					return fmt.Errorf("unexpected response nonce %q for %s, expected one of (type nonce) %v", nonce, m.GetTypeUrl(), sortedKeys(outstanding))
 				}
-				delete(outstanding, nonce)
+				delete(outstanding, key)
 			}
 			if m.GetErrorDetail() != nil {
 				return fmt.Errorf("envoy sent error %q", m.GetErrorDetail().GetMessage())
 			}
 		case *discoveryv3.DeltaDiscoveryResponse:
-			if sent[m.GetNonce()] {
-				return fmt.Errorf("sent nonce %q more than once", m.GetNonce())
+			key := m.GetTypeUrl() + " " + m.GetNonce()
+			if sent[key] {
+				return fmt.Errorf("sent nonce %q for %s more than once", m.GetNonce(), m.GetTypeUrl())
 			}
-			sent[m.GetNonce()] = true
-			outstanding[m.GetNonce()] = true
+			sent[key] = true
+			outstanding[key] = true
 		default:
 			return unexpected(m)
 		}
 	}
 	if len(outstanding) > 0 {
-		return fmt.Errorf("unacked nonces %v", sortedKeys(outstanding))
+		return fmt.Errorf("unacked responses (type nonce): %v", sortedKeys(outstanding))
 	}
 	return nil
 }
@@ -161,7 +164,7 @@ func (d delta) WasMakeBeforeBreakAfter(before *Conversation, fromMessage int) er
 
 // replayDelta tracks what Envoy ACKs in messages, checking responses from checkFrom on, or none if it's negative.
 func replayDelta(state *ackedState, messages []proto.Message, checkFrom int) error {
-	pending := map[string]*discoveryv3.DeltaDiscoveryResponse{}
+	pending := map[string]*discoveryv3.DeltaDiscoveryResponse{} // by "type nonce"
 	for i, m := range messages {
 		switch m := m.(type) {
 		case *discoveryv3.DeltaDiscoveryResponse:
@@ -170,13 +173,14 @@ func replayDelta(state *ackedState, messages []proto.Message, checkFrom int) err
 					return err
 				}
 			}
-			pending[m.GetNonce()] = m
+			pending[m.GetTypeUrl()+" "+m.GetNonce()] = m
 		case *discoveryv3.DeltaDiscoveryRequest:
-			if acked, ok := pending[m.GetResponseNonce()]; ok && m.GetErrorDetail() == nil {
+			key := m.GetTypeUrl() + " " + m.GetResponseNonce()
+			if acked, ok := pending[key]; ok && m.GetErrorDetail() == nil {
 				if err := state.acked(acked.GetTypeUrl(), deltaResources(acked), acked.GetRemovedResources()); err != nil {
 					return err
 				}
-				delete(pending, m.GetResponseNonce())
+				delete(pending, key)
 			}
 			if m.GetErrorDetail() == nil {
 				// Envoy drops what it unsubscribes from, e.g. a route config once no listener uses it.
