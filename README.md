@@ -177,7 +177,7 @@ err = match.HasRouteConfig(dump, match.Routing("foo", "foo-v2"))
   `Routing(virtualHost, cluster)` and `WithEndpoint(address, port)`.
 - Messages: `Response(typeURL, ...)`, `Request(typeURL, ...)` and `Nack(typeURL, ...)` (`""` for any type), with
   `Containing`, `Removing`, `SubscribingTo`, `UnsubscribingFrom` (delta only) and `WithMessage`. For SotW, `Removing`
-  matches a wildcard (CDS, LDS) response without the resource.
+  matches a wildcard (LDS, CDS, SRDS) response without the resource.
 - Conversations: `HasMessage`, and `InOrder` with `AckOf`, Envoy's ACK of a matching response.
 - Envoy: `ActiveClusters`, `ActiveClusterNames`, `HasActiveCluster` and `HasRouteConfig` on a config dump.
 - `Not`, `AllOf` and `AnyOf` combine matchers, and `New` makes your own.

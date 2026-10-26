@@ -64,7 +64,7 @@ func Containing(m Matcher[proto.Message]) Matcher[ResponseView] {
 }
 
 // Removing matches a response that removes this resource. For delta, it's in removed_resources. For SotW, only
-// wildcard types (LDS, CDS) can remove one, by leaving it out, so this matches a wildcard response without it.
+// wildcard types (LDS, CDS, SRDS) can remove one, by leaving it out, so this matches a wildcard response without it.
 func Removing(name string) Matcher[ResponseView] {
 	return New(fmt.Sprintf("removing %q", name), func(r ResponseView) bool {
 		if r.Delta {

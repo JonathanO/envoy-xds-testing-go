@@ -175,7 +175,7 @@ func replaySotw(state *ackedState, messages []proto.Message, checkFrom int) erro
 	for i, m := range messages {
 		switch m := m.(type) {
 		case *discoveryv3.DiscoveryResponse:
-			// CDS and LDS are wildcard types: each response is the full set, so anything Envoy has that's missing is removed.
+			// LDS, CDS and SRDS are wildcard types: each response is the full set, so anything Envoy has that's missing is removed.
 			var removed []string
 			if m.GetTypeUrl() == CDS || m.GetTypeUrl() == LDS {
 				had := state.clusters

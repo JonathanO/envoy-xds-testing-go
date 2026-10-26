@@ -148,3 +148,13 @@ func TestSotwNonceEchoedFromThePreviousStream(t *testing.T) {
 	c.Add(&discoveryv3.DiscoveryRequest{TypeUrl: CDS, ResponseNonce: "1"})
 	wantProblem(t, Sotw(c).AllWereAcked(), "which Envoy had echoed from its previous stream")
 }
+
+func TestWildcardTypesAreTheOnesEnvoySubscribesToWithAWildcard(t *testing.T) {
+	// The xDS docs name only LDS and CDS, but Envoy's SRDS subscription also starts with no names:
+	// source/common/router/scoped_rds.h, subscription_->start({}).
+	for _, typeURL := range []string{LDS, RDS, SRDS, VHDS, CDS, EDS, SDS, RTDS} {
+		if want := typeURL == LDS || typeURL == CDS || typeURL == SRDS; IsWildcard(typeURL) != want {
+			t.Errorf("IsWildcard(%s) = %v, want %v", typeURL, !want, want)
+		}
+	}
+}
