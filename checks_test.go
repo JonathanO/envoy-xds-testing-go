@@ -201,3 +201,10 @@ func TestSotwMakeBeforeBreakDoesNotTakeAnAckOfAnotherTypesNonce(t *testing.T) {
 	}
 	wantProblem(t, Sotw(c).WasMakeBeforeBreak(0), `route "routes" sent using cluster "b" before Envoy ACKed the cluster`)
 }
+
+func TestDeltaAllWereAckedCatchesANonceReusedAfterItsAck(t *testing.T) {
+	c := NewConversation()
+	deltaExchange(t, c, CDS, "1", nil, edsCluster("a"))
+	deltaExchange(t, c, CDS, "1", []string{"a"})
+	wantProblem(t, Delta(c).AllWereAcked(), `sent nonce "1" more than once`)
+}

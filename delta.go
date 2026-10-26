@@ -19,6 +19,7 @@ type delta struct {
 }
 
 func (d delta) AllWereAcked() error {
+	sent := map[string]bool{}
 	outstanding := map[string]bool{}
 	for _, m := range d.c.Messages() {
 		switch m := m.(type) {
@@ -33,9 +34,10 @@ func (d delta) AllWereAcked() error {
 				return fmt.Errorf("envoy sent error %q", m.GetErrorDetail().GetMessage())
 			}
 		case *discoveryv3.DeltaDiscoveryResponse:
-			if outstanding[m.GetNonce()] {
+			if sent[m.GetNonce()] {
 				return fmt.Errorf("sent nonce %q more than once", m.GetNonce())
 			}
+			sent[m.GetNonce()] = true
 			outstanding[m.GetNonce()] = true
 		default:
 			return unexpected(m)
