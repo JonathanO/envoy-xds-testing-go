@@ -158,3 +158,25 @@ func TestWildcardTypesAreTheOnesEnvoySubscribesToWithAWildcard(t *testing.T) {
 		}
 	}
 }
+
+func TestMakeBeforeBreakFindsEndpointsUnderTheClustersEdsServiceName(t *testing.T) {
+	cluster := edsCluster("v1")
+	cluster.EdsClusterConfig = &clusterv3.Cluster_EdsClusterConfig{ServiceName: "v1-endpoints"}
+	endpoints := &endpointv3.ClusterLoadAssignment{ClusterName: "v1-endpoints"}
+
+	c := NewConversation()
+	sotwExchange(t, c, CDS, "1", cluster)
+	sotwExchange(t, c, EDS, "2", endpoints)
+	sotwExchange(t, c, RDS, "3", routeTo("v1"))
+	if err := Sotw(c).WasMakeBeforeBreak(0); err != nil {
+		t.Error(err)
+	}
+
+	c = NewConversation()
+	deltaExchange(t, c, CDS, "1", nil, cluster)
+	deltaExchange(t, c, EDS, "2", nil, endpoints)
+	deltaExchange(t, c, RDS, "3", nil, routeTo("v1"))
+	if err := Delta(c).WasMakeBeforeBreak(0); err != nil {
+		t.Error(err)
+	}
+}
