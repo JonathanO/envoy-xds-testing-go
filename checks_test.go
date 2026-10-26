@@ -32,13 +32,17 @@ func routeTo(clusters ...string) *routev3.RouteConfiguration {
 	return &routev3.RouteConfiguration{Name: "routes", VirtualHosts: []*routev3.VirtualHost{vh}}
 }
 
-// sotwExchange is a SotW response and Envoy's ACK of it.
-func sotwExchange(t *testing.T, c *Conversation, typeURL, nonce string, resources ...proto.Message) {
+func sotwResponse(t *testing.T, c *Conversation, typeURL, nonce string, resources ...proto.Message) {
 	r := &discoveryv3.DiscoveryResponse{TypeUrl: typeURL, Nonce: nonce}
 	for _, m := range resources {
 		r.Resources = append(r.Resources, anyOf(t, m))
 	}
 	c.Add(r)
+}
+
+// sotwExchange is a SotW response and Envoy's ACK of it.
+func sotwExchange(t *testing.T, c *Conversation, typeURL, nonce string, resources ...proto.Message) {
+	sotwResponse(t, c, typeURL, nonce, resources...)
 	c.Add(&discoveryv3.DiscoveryRequest{TypeUrl: typeURL, ResponseNonce: nonce})
 }
 
@@ -179,4 +183,21 @@ func TestMakeBeforeBreakFindsEndpointsUnderTheClustersEdsServiceName(t *testing.
 	if err := Delta(c).WasMakeBeforeBreak(0); err != nil {
 		t.Error(err)
 	}
+}
+
+func TestSotwMakeBeforeBreakDoesNotTakeAnAckOfAnotherTypesNonce(t *testing.T) {
+	// Envoy keeps SotW nonces per type, so EDS's ACK of its nonce 2 isn't CDS's.
+	c := NewConversation()
+	sotwExchange(t, c, CDS, "1", edsCluster("a"))
+	sotwExchange(t, c, EDS, "1", &endpointv3.ClusterLoadAssignment{ClusterName: "a"})
+	sotwResponse(t, c, EDS, "2", &endpointv3.ClusterLoadAssignment{ClusterName: "a"})
+	sotwResponse(t, c, CDS, "2", edsCluster("a"), &clusterv3.Cluster{Name: "b"})
+	c.Add(&discoveryv3.DiscoveryRequest{TypeUrl: EDS, ResponseNonce: "2"})
+	sotwResponse(t, c, RDS, "1", routeTo("b"))
+	c.Add(&discoveryv3.DiscoveryRequest{TypeUrl: CDS, ResponseNonce: "2"})
+	c.Add(&discoveryv3.DiscoveryRequest{TypeUrl: RDS, ResponseNonce: "1"})
+	if err := Sotw(c).AllWereAcked(); err != nil {
+		t.Error(err)
+	}
+	wantProblem(t, Sotw(c).WasMakeBeforeBreak(0), `route "routes" sent using cluster "b" before Envoy ACKed the cluster`)
 }
