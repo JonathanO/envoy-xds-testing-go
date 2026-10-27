@@ -42,6 +42,21 @@ func TestIdleHookMustBeIdleAndEverythingAnswered(t *testing.T) {
 	}
 }
 
+func TestNoncesAreAnsweredPerType(t *testing.T) {
+	c := NewConversation()
+	c.Add(&discoveryv3.DeltaDiscoveryResponse{TypeUrl: CDS, Nonce: "1"})
+	c.Add(&discoveryv3.DeltaDiscoveryResponse{TypeUrl: EDS, Nonce: "1"})
+	c.Add(&discoveryv3.DeltaDiscoveryRequest{TypeUrl: CDS, ResponseNonce: "1"})
+	if SettledIdle(c, func() bool { return true })() == nil {
+		t.Error("settled with EDS unanswered, as CDS used the same nonce")
+	}
+
+	c.Add(&discoveryv3.DeltaDiscoveryRequest{TypeUrl: EDS, ResponseNonce: "1"})
+	if err := SettledIdle(c, func() bool { return true })(); err != nil {
+		t.Error(err)
+	}
+}
+
 func TestSettledAfterWaitsForSomethingToBeSent(t *testing.T) {
 	c := NewConversation()
 	mark := c.Size()
