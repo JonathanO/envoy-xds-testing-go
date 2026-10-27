@@ -8,6 +8,7 @@
 //     foo-v2 is sent before Envoy ACKs foo-v2.
 //   - AddsAndRemovesListener fails everywhere: the listener's route config is sent before Envoy ACKs its cluster.
 //   - Churns fails everywhere: as MovesRouteToNewCluster, many times over.
+//   - ChangesEndpoints passes everywhere: an endpoint change alone has nothing to order.
 //   - ContainsRejectedConfig fails on SotW: the rejected cluster is sent again, and Envoy keeps rejecting it. It passes
 //     on delta.
 //   - Reconnects fails on delta rate limited: it never answers EDS after the reconnect. It passes everywhere else.
