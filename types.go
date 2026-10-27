@@ -17,9 +17,9 @@ const (
 	RTDS = "type.googleapis.com/envoy.service.runtime.v3.Runtime"
 )
 
-// IsWildcard reports whether Envoy subscribes to a type as a wildcard (all resources) by default: LDS, CDS and SRDS.
+// IsWildcard reports whether Envoy subscribes to a type as a wildcard (all resources) by default: LDS, CDS, SRDS and VHDS.
 func IsWildcard(typeURL string) bool {
-	return typeURL == LDS || typeURL == CDS || typeURL == SRDS
+	return typeURL == LDS || typeURL == CDS || typeURL == SRDS || typeURL == VHDS
 }
 
 // NameOf is the name Envoy knows a resource by: its name field, or cluster_name for a ClusterLoadAssignment. It's ""

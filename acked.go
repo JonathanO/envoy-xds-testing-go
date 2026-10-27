@@ -22,11 +22,13 @@ type ackedState struct {
 	endpoints   map[string]bool
 	routes      map[string]map[string]bool // clusters used, by route config name
 	listeners   map[string]map[string]bool // route configs used, by listener name
+	scopes      map[string]string          // the route config each scoped route config names
+	vhosts      map[string]map[string]bool // clusters used, by VHDS virtual host name
 	problems    []string
 }
 
 func newAckedState() *ackedState {
-	return &ackedState{clusters: map[string]bool{}, edsClusters: map[string]string{}, endpoints: map[string]bool{}, routes: map[string]map[string]bool{}, listeners: map[string]map[string]bool{}}
+	return &ackedState{clusters: map[string]bool{}, edsClusters: map[string]string{}, endpoints: map[string]bool{}, routes: map[string]map[string]bool{}, listeners: map[string]map[string]bool{}, scopes: map[string]string{}, vhosts: map[string]map[string]bool{}}
 }
 
 // checkResponse checks a response before Envoy sees it.
@@ -38,13 +40,7 @@ func (s *ackedState) checkResponse(typeURL string, resources []*anypb.Any, remov
 			if err := a.UnmarshalTo(route); err != nil {
 				return err
 			}
-			for _, c := range sortedKeys(referencedClusters(route)) {
-				if !s.clusters[c] {
-					s.problems = append(s.problems, fmt.Sprintf("route %q sent using cluster %q before Envoy ACKed the cluster", route.GetName(), c))
-				} else if edsName, ok := s.edsClusters[c]; ok && !s.endpoints[edsName] {
-					s.problems = append(s.problems, fmt.Sprintf("route %q sent using cluster %q before Envoy ACKed its endpoints", route.GetName(), c))
-				}
-			}
+			s.checkClustersAcked(fmt.Sprintf("route %q", route.GetName()), referencedClusters(route.GetVirtualHosts()))
 		}
 		for _, r := range removed {
 			for _, name := range sortedKeys(boolKeys(s.listeners)) {
@@ -52,6 +48,19 @@ func (s *ackedState) checkResponse(typeURL string, resources []*anypb.Any, remov
 					s.problems = append(s.problems, fmt.Sprintf("route config %q removed while Envoy's ACKed listener %q still uses it", r, name))
 				}
 			}
+			for _, name := range sortedKeys(boolKeys(s.scopes)) {
+				if s.scopes[name] == r {
+					s.problems = append(s.problems, fmt.Sprintf("route config %q removed while Envoy's ACKed scoped route config %q still uses it", r, name))
+				}
+			}
+		}
+	case VHDS:
+		for _, a := range resources {
+			vh := &routev3.VirtualHost{}
+			if err := a.UnmarshalTo(vh); err != nil {
+				return err
+			}
+			s.checkClustersAcked(fmt.Sprintf("virtual host %q", vh.GetName()), referencedClusters([]*routev3.VirtualHost{vh}))
 		}
 	case CDS:
 		for _, c := range removed {
@@ -60,9 +69,24 @@ func (s *ackedState) checkResponse(typeURL string, resources []*anypb.Any, remov
 					s.problems = append(s.problems, fmt.Sprintf("cluster %q removed while Envoy's ACKed route %q still uses it", c, name))
 				}
 			}
+			for _, name := range sortedKeys(boolKeys(s.vhosts)) {
+				if s.vhosts[name][c] {
+					s.problems = append(s.problems, fmt.Sprintf("cluster %q removed while Envoy's ACKed virtual host %q still uses it", c, name))
+				}
+			}
 		}
 	}
 	return nil
+}
+
+func (s *ackedState) checkClustersAcked(what string, used map[string]bool) {
+	for _, c := range sortedKeys(used) {
+		if !s.clusters[c] {
+			s.problems = append(s.problems, fmt.Sprintf("%s sent using cluster %q before Envoy ACKed the cluster", what, c))
+		} else if edsName, ok := s.edsClusters[c]; ok && !s.endpoints[edsName] {
+			s.problems = append(s.problems, fmt.Sprintf("%s sent using cluster %q before Envoy ACKed its endpoints", what, c))
+		}
+	}
 }
 
 // acked records a response Envoy has ACKed.
@@ -102,10 +126,36 @@ func (s *ackedState) acked(typeURL string, resources []*anypb.Any, removed []str
 			if err := a.UnmarshalTo(route); err != nil {
 				return err
 			}
-			s.routes[route.GetName()] = referencedClusters(route)
+			s.routes[route.GetName()] = referencedClusters(route.GetVirtualHosts())
 		}
 		for _, r := range removed {
 			delete(s.routes, r)
+		}
+	case VHDS:
+		for _, a := range resources {
+			vh := &routev3.VirtualHost{}
+			if err := a.UnmarshalTo(vh); err != nil {
+				return err
+			}
+			s.vhosts[vh.GetName()] = referencedClusters([]*routev3.VirtualHost{vh})
+		}
+		for _, v := range removed {
+			delete(s.vhosts, v)
+		}
+	case SRDS:
+		for _, a := range resources {
+			scope := &routev3.ScopedRouteConfiguration{}
+			if err := a.UnmarshalTo(scope); err != nil {
+				return err
+			}
+			s.scopes[scope.GetName()] = scope.GetRouteConfigurationName()
+		}
+		for _, gone := range removed {
+			// As for a removed listener: its route config is unused once nothing else names it.
+			if r, ok := s.scopes[gone]; ok {
+				delete(s.scopes, gone)
+				s.dropIfUnused(r)
+			}
 		}
 	case LDS:
 		for _, a := range resources {
@@ -125,17 +175,26 @@ func (s *ackedState) acked(typeURL string, resources []*anypb.Any, removed []str
 			used := s.listeners[gone]
 			delete(s.listeners, gone)
 			for r := range used {
-				stillUsed := false
-				for _, other := range s.listeners {
-					stillUsed = stillUsed || other[r]
-				}
-				if !stillUsed {
-					delete(s.routes, r)
-				}
+				s.dropIfUnused(r)
 			}
 		}
 	}
 	return nil
+}
+
+// dropIfUnused forgets a route config no listener or scoped route config names: what it routes to is unused.
+func (s *ackedState) dropIfUnused(routeConfig string) {
+	for _, used := range s.listeners {
+		if used[routeConfig] {
+			return
+		}
+	}
+	for _, used := range s.scopes {
+		if used == routeConfig {
+			return
+		}
+	}
+	delete(s.routes, routeConfig)
 }
 
 // routeConfigsUsed are the route configs a listener's HTTP connection managers get by RDS.
@@ -166,9 +225,9 @@ func (s *ackedState) err() error {
 	return errors.New("not make before break: " + strings.Join(s.problems, "; "))
 }
 
-func referencedClusters(route *routev3.RouteConfiguration) map[string]bool {
+func referencedClusters(virtualHosts []*routev3.VirtualHost) map[string]bool {
 	used := map[string]bool{}
-	for _, vh := range route.GetVirtualHosts() {
+	for _, vh := range virtualHosts {
 		for _, r := range vh.GetRoutes() {
 			action := r.GetRoute()
 			if action.GetCluster() != "" {
