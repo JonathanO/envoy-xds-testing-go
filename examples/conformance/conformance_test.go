@@ -66,7 +66,8 @@ func (g *goControlPlane) Register(s *grpc.Server) {
 
 func (g *goControlPlane) SetConfig(resources []proto.Message) {
 	// Every type needs an entry, even an empty one, or go-control-plane never answers Envoy's request for it.
-	byType := map[resourcev3.Type][]types.Resource{resourcev3.ClusterType: nil, resourcev3.EndpointType: nil, resourcev3.ListenerType: nil, resourcev3.RouteType: nil}
+	byType := map[resourcev3.Type][]types.Resource{resourcev3.ClusterType: nil, resourcev3.EndpointType: nil, resourcev3.ListenerType: nil, resourcev3.RouteType: nil,
+		resourcev3.ScopedRouteType: nil, resourcev3.VirtualHostType: nil}
 	for _, r := range resources {
 		switch r.(type) {
 		case *clusterv3.Cluster:
@@ -77,6 +78,10 @@ func (g *goControlPlane) SetConfig(resources []proto.Message) {
 			byType[resourcev3.ListenerType] = append(byType[resourcev3.ListenerType], r)
 		case *routev3.RouteConfiguration:
 			byType[resourcev3.RouteType] = append(byType[resourcev3.RouteType], r)
+		case *routev3.ScopedRouteConfiguration:
+			byType[resourcev3.ScopedRouteType] = append(byType[resourcev3.ScopedRouteType], r)
+		case *routev3.VirtualHost:
+			byType[resourcev3.VirtualHostType] = append(byType[resourcev3.VirtualHostType], r)
 		}
 	}
 	snapshot, err := cache.NewSnapshot(strconv.FormatInt(g.version.Add(1), 10), byType)
