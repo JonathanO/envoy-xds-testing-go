@@ -210,6 +210,28 @@ func (e *Envoy) Stats(ctx context.Context) (map[string]uint64, error) {
 	return stats, scanner.Err()
 }
 
+// Clusters returns what Envoy has per host, from its /clusters admin page: the numeric values by everything before the
+// last "::", e.g. "foo::127.0.0.2:9901::rq_total".
+func (e *Envoy) Clusters(ctx context.Context) (map[string]uint64, error) {
+	body, err := e.admin(ctx, "/clusters")
+	if err != nil {
+		return nil, err
+	}
+	values := map[string]uint64{}
+	scanner := bufio.NewScanner(bytes.NewReader(body))
+	for scanner.Scan() {
+		line := scanner.Text()
+		sep := strings.LastIndex(line, "::")
+		if sep <= 0 {
+			continue
+		}
+		if n, err := strconv.ParseUint(line[sep+2:], 10, 64); err == nil {
+			values[line[:sep]] = n
+		}
+	}
+	return values, scanner.Err()
+}
+
 // ConfigDump returns Envoy's config dump. query is added to the admin URL, e.g. "?resource=dynamic_active_clusters",
 // or "" for everything. Decoding needs every type in the dump to be linked in: blank import the go-control-plane
 // packages for any extensions your config uses.

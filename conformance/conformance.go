@@ -76,6 +76,8 @@ type Options struct {
 	New func(t *testing.T) ControlPlane
 	// Protocols the library supports, by default both. Conformance results should say if it's not both.
 	Protocols []Protocol
+	// EnvoyImages to run on, tagged v1.NN..., by default EnvoyImages. Conformance results should say if it's not those.
+	EnvoyImages []string
 	// Skip records known deviations, with a reason. A key is a test's path, or part of it: any of protocol (sotw,
 	// delta), Envoy version (v1.36), mode (normal, rate-limited) and scenario (ChangesWhileDisconnected), joined by "/".
 	// "sotw/ChangesWhileDisconnected" skips that scenario on SotW everywhere.
@@ -105,7 +107,7 @@ var (
 	deltaBootstrap []byte
 )
 
-// Run runs every scenario as subtests of t: on each protocol, on each of EnvoyImages, normally and with Envoy's requests
+// Run runs every scenario as subtests of t: on each protocol, on each of the Envoy images, normally and with Envoy's requests
 // rate limited, e.g. t/sotw/v1.36/rate-limited/StartsEmpty. Envoy connects to port 6566 on the host, so don't run it in
 // parallel.
 func Run(t *testing.T, o Options) {
@@ -119,6 +121,7 @@ func Run(t *testing.T, o Options) {
 	}{
 		{name: "StartsEmpty", run: startsEmpty},
 		{name: "AddsAndRemovesServices", run: addsAndRemovesServices},
+		{name: "ChangesEndpoints", run: changesEndpoints},
 		{name: "MovesRouteToNewCluster", run: movesRouteToNewCluster},
 		{name: "ContainsRejectedConfig", run: containsRejectedConfig},
 		{name: "Reconnects", run: reconnects},
@@ -137,9 +140,13 @@ func Run(t *testing.T, o Options) {
 	if len(protocols) == 0 {
 		protocols = []Protocol{Sotw, Delta}
 	}
+	images := o.EnvoyImages
+	if len(images) == 0 {
+		images = EnvoyImages
+	}
 	for _, protocol := range protocols {
 		t.Run(string(protocol), func(t *testing.T) {
-			for _, image := range EnvoyImages {
+			for _, image := range images {
 				version := strings.TrimSuffix(image[strings.LastIndex(image, ":")+1:], "-latest")
 				t.Run(version, func(t *testing.T) {
 					for _, rateLimited := range []bool{false, true} {
@@ -211,6 +218,31 @@ func addsAndRemovesServices(h *harness) {
 	h.must(h.checkpoint.Sane(h.ctx))
 	h.assertStatus("bar", 404)
 	h.assertStatus("foo", 200)
+}
+
+// ChangesEndpoints: only a service's endpoints change, the commonest change in a mesh: one replaced and one added, then
+// one removed. Envoy must route to the new endpoints, without rebuilding the cluster.
+func changesEndpoints(h *harness) {
+	h.cp.SetConfig(services("foo"))
+	h.start()
+	c := h.synced(1)
+	h.assertRoutedToEndpoints("foo", "127.0.0.1")
+	stats, err := h.envoy.Stats(h.ctx)
+	h.must(err)
+	modified := stats["cluster_manager.cluster_modified"]
+
+	h.change(c, withEndpoints(services("foo"), "foo", "127.0.0.2", "127.0.0.3"))
+	h.must(h.checkpoint.Sane(h.ctx))
+	h.assertRoutedToEndpoints("foo", "127.0.0.2", "127.0.0.3")
+
+	h.change(c, withEndpoints(services("foo"), "foo", "127.0.0.3"))
+	h.must(h.checkpoint.Sane(h.ctx))
+	h.assertRoutedToEndpoints("foo", "127.0.0.3")
+	stats, err = h.envoy.Stats(h.ctx)
+	h.must(err)
+	if got := stats["cluster_manager.cluster_modified"]; got != modified {
+		h.t.Fatalf("cluster_manager.cluster_modified went from %d to %d; only endpoints changed", modified, got)
+	}
 }
 
 // MovesRouteToNewCluster: a route moved to a new cluster, and its old cluster removed, in one change.
@@ -590,6 +622,50 @@ func (h *harness) assertStatusOn(port int, virtualHost string, want int) {
 	}))
 }
 
+// assertRoutedToEndpoints checks the cluster of this name has just these endpoints, and a request for the virtual host
+// of this name went to one of them: its rq_total went up. It retries while Envoy's workers catch up.
+func (h *harness) assertRoutedToEndpoints(name string, addresses ...string) {
+	h.t.Helper()
+	var want []string
+	for _, a := range addresses {
+		want = append(want, fmt.Sprintf("%s::%s:%d", name, a, xdstest.AdminPort))
+	}
+	slices.Sort(want)
+	h.must(xdstest.WaitFor(5*time.Second, func() error {
+		before, err := h.envoy.Clusters(h.ctx)
+		if err != nil {
+			return err
+		}
+		var hosts []string
+		for k := range before {
+			if host, ok := strings.CutSuffix(k, "::rq_total"); ok && strings.HasPrefix(k, name+"::") {
+				hosts = append(hosts, host)
+			}
+		}
+		slices.Sort(hosts)
+		if !slices.Equal(hosts, want) {
+			return fmt.Errorf("%s's endpoints %v, want %v", name, hosts, want)
+		}
+		status, err := h.envoy.HTTPStatus(h.ctx, listenerPort, name)
+		if err != nil {
+			return err
+		}
+		if status != 200 {
+			return fmt.Errorf("%s: status %d, want 200", name, status)
+		}
+		after, err := h.envoy.Clusters(h.ctx)
+		if err != nil {
+			return err
+		}
+		for _, host := range want {
+			if after[host+"::rq_total"] > before[host+"::rq_total"] {
+				return nil
+			}
+		}
+		return fmt.Errorf("%s: request didn't go to any of %v", name, want)
+	}))
+}
+
 // assertFirstRequestRoutedVia: the first request for something Envoy gets on demand is held until it arrives, so it
 // succeeds first time, with no retrying. Then everything Envoy was sent for it must have been make before break.
 func (h *harness) assertFirstRequestRoutedVia(c *xdstest.Conversation, virtualHost, cluster string) {
@@ -813,19 +889,35 @@ func cluster(name string) *clusterv3.Cluster {
 	}
 }
 
-// endpoints points at Envoy's own admin port, which stands in for the upstream: every 127/8 address in its container
-// reaches it.
 func endpoints(clusterName string) *endpointv3.ClusterLoadAssignment {
-	return &endpointv3.ClusterLoadAssignment{
-		ClusterName: clusterName,
-		Endpoints: []*endpointv3.LocalityLbEndpoints{{LbEndpoints: []*endpointv3.LbEndpoint{{
+	return endpointsAt(clusterName, "127.0.0.1")
+}
+
+// endpointsAt points at Envoy's own admin port, which stands in for the upstream: every 127/8 address in its container
+// reaches it.
+func endpointsAt(clusterName string, addresses ...string) *endpointv3.ClusterLoadAssignment {
+	locality := &endpointv3.LocalityLbEndpoints{}
+	for _, address := range addresses {
+		locality.LbEndpoints = append(locality.LbEndpoints, &endpointv3.LbEndpoint{
 			HostIdentifier: &endpointv3.LbEndpoint_Endpoint{Endpoint: &endpointv3.Endpoint{Address: &corev3.Address{
 				Address: &corev3.Address_SocketAddress{SocketAddress: &corev3.SocketAddress{
-					Address: "127.0.0.1", PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: xdstest.AdminPort},
+					Address: address, PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: xdstest.AdminPort},
 				}},
 			}}},
-		}}}},
+		})
 	}
+	return &endpointv3.ClusterLoadAssignment{ClusterName: clusterName, Endpoints: []*endpointv3.LocalityLbEndpoints{locality}}
+}
+
+// withEndpoints moves the cluster's endpoints to these 127/8 addresses, changing nothing else.
+func withEndpoints(config []proto.Message, clusterName string, addresses ...string) []proto.Message {
+	moved := slices.Clone(config)
+	for i, m := range moved {
+		if cla, ok := m.(*endpointv3.ClusterLoadAssignment); ok && cla.ClusterName == clusterName {
+			moved[i] = endpointsAt(clusterName, addresses...)
+		}
+	}
+	return moved
 }
 
 func virtualHost(name, clusterName string) *routev3.VirtualHost {
