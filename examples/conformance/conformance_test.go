@@ -16,6 +16,9 @@
 //     SotW, it never answers LDS: this example numbers snapshot versions from 1 in each control plane, so the new one's
 //     version matches the one Envoy kept, and go-control-plane takes Envoy to be up to date. Versions that differ
 //     across restarts, e.g. hashes of the config, avoid that.
+//   - ScopedRoutes fails everywhere: the route configs to bar are sent before Envoy ACKs bar's cluster.
+//   - OnDemandScopes fails on SotW: Envoy's first RDS request is never answered. It passes on delta.
+//   - OnDemandClusters and OnDemandVirtualHosts (delta only) pass. OnDemandVirtualHosts is skipped on Envoy 1.36.
 //
 // The make before break failures are all one cause: go-control-plane sends each snapshot one type at a time, in a
 // fixed order, without waiting for Envoy's ACKs.
