@@ -16,6 +16,9 @@
 //     SotW, it never answers LDS: this example numbers snapshot versions from 1 in each control plane, so the new one's
 //     version matches the one Envoy kept, and go-control-plane takes Envoy to be up to date. Versions that differ
 //     across restarts, e.g. hashes of the config, avoid that.
+//   - ScopedRoutes fails everywhere: the route configs to bar are sent before Envoy ACKs bar's cluster.
+//   - OnDemandScopes fails on SotW: Envoy's first RDS request is never answered. It passes on delta.
+//   - OnDemandClusters and OnDemandVirtualHosts (delta only) pass. OnDemandVirtualHosts is skipped on Envoy 1.36.
 //
 // The make before break failures are all one cause: go-control-plane sends each snapshot one type at a time, in a
 // fixed order, without waiting for Envoy's ACKs.
@@ -66,7 +69,8 @@ func (g *goControlPlane) Register(s *grpc.Server) {
 
 func (g *goControlPlane) SetConfig(resources []proto.Message) {
 	// Every type needs an entry, even an empty one, or go-control-plane never answers Envoy's request for it.
-	byType := map[resourcev3.Type][]types.Resource{resourcev3.ClusterType: nil, resourcev3.EndpointType: nil, resourcev3.ListenerType: nil, resourcev3.RouteType: nil}
+	byType := map[resourcev3.Type][]types.Resource{resourcev3.ClusterType: nil, resourcev3.EndpointType: nil, resourcev3.ListenerType: nil, resourcev3.RouteType: nil,
+		resourcev3.ScopedRouteType: nil, resourcev3.VirtualHostType: nil}
 	for _, r := range resources {
 		switch r.(type) {
 		case *clusterv3.Cluster:
@@ -77,6 +81,10 @@ func (g *goControlPlane) SetConfig(resources []proto.Message) {
 			byType[resourcev3.ListenerType] = append(byType[resourcev3.ListenerType], r)
 		case *routev3.RouteConfiguration:
 			byType[resourcev3.RouteType] = append(byType[resourcev3.RouteType], r)
+		case *routev3.ScopedRouteConfiguration:
+			byType[resourcev3.ScopedRouteType] = append(byType[resourcev3.ScopedRouteType], r)
+		case *routev3.VirtualHost:
+			byType[resourcev3.VirtualHostType] = append(byType[resourcev3.VirtualHostType], r)
 		}
 	}
 	snapshot, err := cache.NewSnapshot(strconv.FormatInt(g.version.Add(1), 10), byType)
