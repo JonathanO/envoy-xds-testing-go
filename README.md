@@ -24,8 +24,8 @@ What's in it:
 
 - `Recorder`: a gRPC stream interceptor that records each xDS stream to and from your server, as a `Conversation`.
 - `Sotw(c)` / `Delta(c)`: checks on a recorded conversation.
-- `StartEnvoy`: starts an Envoy container that keeps its log. It can fetch `Stats`, fetch a `ConfigDump`, and send a
-  request through a listener with `HTTPStatus`.
+- `StartEnvoy`: starts an Envoy container that keeps its log. It can fetch `Stats`, per-host `Clusters`, fetch a
+  `ConfigDump`, and send a request through a listener with `HTTPStatus`.
 - `Envoy.Healthy` / `Envoy.WarningsSince`: checks on Envoy itself. It is connected, rejected nothing, has nothing
   warming, timed out no initial fetches, and logged no warnings or errors.
 - `Settled`, `SettledIdle`, `SettledAfter`: conditions to wait on until your control plane and Envoy have stopped
@@ -246,20 +246,23 @@ Implement `Idle() bool` too (`conformance.IdleReporter`) if your library can tel
 The suite owns the matrix, so every library is tested the same way. It runs every scenario:
 - on both protocols, unless `Options.Protocols` narrows it for a library that only does one. The on-demand cluster and
   virtual host scenarios run on delta only, as Envoy only does those over delta;
-- on each of `conformance.EnvoyImages`, the oldest Envoy release upstream still supports (1.36) and the newest (1.40);
+- on each of `conformance.EnvoyImages`, the oldest Envoy release upstream still supports (1.36) and the newest (1.40).
+  Set `Options.EnvoyImages` to run on others, e.g. every supported release;
 - with Envoy getting listeners from the control plane (LDS) as well as its static listener, so serve LDS too, and
   scoped route configs (SRDS) and virtual hosts (VHDS) for the scenarios that use them;
 - normally, and with Envoy's requests to the control plane rate limited (`rate_limit_settings`). Envoy then queues
   them, and delta Envoy sends ACKs ahead of queued subscriptions, so after a reconnect requests arrive in a different
   order. The reconnect scenarios check the limit was actually hit.
 
-That's 96 subtests and takes several minutes, so run it in CI or before a release rather than on every build. Subtests
+That's 104 subtests and takes several minutes, so run it in CI or before a release rather than on every build. Subtests
 are named by their path, e.g. `TestConformance/sotw/v1.36/rate-limited/StartsEmpty`. The scenarios:
 
 - `StartsEmpty`: no config at first. Envoy gets an answer for every type it asks for, including a route config that
   doesn't exist yet, then takes the first service.
 - `AddsAndRemovesServices`: a route, its cluster and its endpoints added in one change, then removed in one change.
   It also adds a cluster with no endpoints, which still needs an empty assignment, or Envoy leaves it warming.
+- `ChangesEndpoints`: only a service's endpoints change, the commonest change in a mesh: one is replaced and one
+  added, then one removed. Envoy must route to the new endpoints, without rebuilding the cluster.
 - `MovesRouteToNewCluster`: a route moved to a new cluster, and the old cluster removed, in one change.
 - `AddsAndRemovesListener`: a listener, its route config, cluster and endpoints added in one change, then removed in
   one change. The listener mustn't be left warming, and a route config mustn't go while a listener Envoy has uses it.
