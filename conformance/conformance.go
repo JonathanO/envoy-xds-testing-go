@@ -22,6 +22,7 @@ import (
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	ondemandv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/on_demand/v3"
 	routerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	discoveryv3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
@@ -40,7 +41,8 @@ type ControlPlane interface {
 	// again with a new server after a reconnect.
 	Register(s *grpc.Server)
 	// SetConfig makes these resources the whole desired config for every Envoy, replacing what was there before:
-	// Clusters, ClusterLoadAssignments and RouteConfigurations.
+	// Clusters, ClusterLoadAssignments, Listeners, RouteConfigurations, ScopedRouteConfigurations and VirtualHosts (for
+	// VHDS, named <route config>/<host>).
 	SetConfig(resources []proto.Message)
 }
 
@@ -85,6 +87,7 @@ type variant struct {
 	protocol    Protocol
 	image       string
 	rateLimited bool // rate_limit_settings on Envoy's requests: it queues them, and delta sends ACKs ahead of queued subscriptions
+	noCDS       bool // no cds_config in Envoy's bootstrap: it subscribes to no clusters, only asking for them on demand
 }
 
 const (
@@ -92,6 +95,7 @@ const (
 	listenerPort        = 10000
 	dynamicListenerPort = 10001        // the listener AddsAndRemovesListener adds
 	routes              = "all_routes" // Envoy's static listener asks for this
+	onDemandFilter      = "envoy.filters.http.on_demand"
 )
 
 var (
@@ -106,18 +110,28 @@ var (
 // parallel.
 func Run(t *testing.T, o Options) {
 	tests := []struct {
-		name string
-		run  func(h *harness)
+		name          string
+		run           func(h *harness)
+		protocols     []Protocol // the protocols Envoy supports it on, if not both
+		noCDS         bool       // Envoy subscribes to no clusters, only asking for them on demand
+		minEnvoyMinor int        // the oldest Envoy minor version that supports it, if not all do
+		why           string     // why older ones don't
 	}{
-		{"StartsEmpty", startsEmpty},
-		{"AddsAndRemovesServices", addsAndRemovesServices},
-		{"MovesRouteToNewCluster", movesRouteToNewCluster},
-		{"ContainsRejectedConfig", containsRejectedConfig},
-		{"Reconnects", reconnects},
-		{"ChangesWhileDisconnected", changesWhileDisconnected},
-		{"AddsAndRemovesListener", addsAndRemovesListener},
-		{"Churns", churns},
-		{"ControlPlaneRestarts", controlPlaneRestarts},
+		{name: "StartsEmpty", run: startsEmpty},
+		{name: "AddsAndRemovesServices", run: addsAndRemovesServices},
+		{name: "MovesRouteToNewCluster", run: movesRouteToNewCluster},
+		{name: "ContainsRejectedConfig", run: containsRejectedConfig},
+		{name: "Reconnects", run: reconnects},
+		{name: "ChangesWhileDisconnected", run: changesWhileDisconnected},
+		{name: "AddsAndRemovesListener", run: addsAndRemovesListener},
+		{name: "Churns", run: churns},
+		{name: "ControlPlaneRestarts", run: controlPlaneRestarts},
+		{name: "ScopedRoutes", run: scopedRoutes},
+		{name: "OnDemandScopes", run: onDemandScopes},
+		// Envoy only does on-demand clusters and virtual hosts over delta.
+		{name: "OnDemandClusters", run: onDemandClusters, protocols: []Protocol{Delta}, noCDS: true},
+		{name: "OnDemandVirtualHosts", run: onDemandVirtualHosts, protocols: []Protocol{Delta}, minEnvoyMinor: 40,
+			why: "Envoy 1.36 only takes VHDS from a DELTA_GRPC config source of its own, not over ADS"},
 	}
 	protocols := o.Protocols
 	if len(protocols) == 0 {
@@ -135,11 +149,17 @@ func Run(t *testing.T, o Options) {
 						}
 						t.Run(mode, func(t *testing.T) {
 							for _, test := range tests {
+								if test.protocols != nil && !slices.Contains(test.protocols, protocol) {
+									continue
+								}
 								t.Run(test.name, func(t *testing.T) {
 									if reason, ok := deviation(o.Skip, string(protocol), version, mode, test.name); ok {
 										t.Skip(reason)
 									}
-									test.run(newHarness(t, o, variant{protocol: protocol, image: image, rateLimited: rateLimited}))
+									if minor, _ := strconv.Atoi(version[strings.Index(version, ".")+1:]); minor < test.minEnvoyMinor {
+										t.Skip(test.why)
+									}
+									test.run(newHarness(t, o, variant{protocol: protocol, image: image, rateLimited: rateLimited, noCDS: test.noCDS}))
 								})
 							}
 						})
@@ -353,6 +373,64 @@ func controlPlaneRestarts(h *harness) {
 	}))
 }
 
+// ScopedRoutes: a listener picks a scope (SRDS) by the Host header, each naming its own route config. A scope, its
+// route config and cluster added in one change, then removed in one change: the scope must go before its route config,
+// and the route config before its cluster.
+func scopedRoutes(h *harness) {
+	h.cp.SetConfig(withScopes(services("foo"), false, "foo"))
+	h.start()
+	c := h.synced(1)
+	h.must(h.envoy.RoutedVia(h.ctx, dynamicListenerPort, "foo", "foo"))
+
+	h.change(c, withScopes(services("foo", "bar"), false, "foo", "bar"))
+	h.must(h.checkpoint.Sane(h.ctx))
+	h.must(h.envoy.RoutedVia(h.ctx, dynamicListenerPort, "bar", "bar"))
+
+	h.change(c, withScopes(services("foo"), false, "foo"))
+	h.must(xdstest.WaitFor(10*time.Second, h.settled(c)))
+	h.must(h.checkpoint.Sane(h.ctx))
+	h.assertStatusOn(dynamicListenerPort, "bar", 404)
+	h.must(h.envoy.RoutedVia(h.ctx, dynamicListenerPort, "foo", "foo"))
+}
+
+// OnDemandScopes: as ScopedRoutes, but Envoy asks for a scope's route config when the first request for it arrives.
+func onDemandScopes(h *harness) {
+	h.cp.SetConfig(withScopes(services("foo", "bar"), true, "foo", "bar"))
+	h.start()
+	c := h.synced(1)
+
+	h.assertFirstRequestRoutedVia(c, "foo", "foo")
+	h.assertFirstRequestRoutedVia(c, "bar", "bar")
+}
+
+// OnDemandClusters (ODCDS): Envoy subscribes to no clusters as it starts, and asks for one, then its endpoints, when
+// the first request routed to it arrives.
+func onDemandClusters(h *harness) {
+	h.cp.SetConfig(clustersOnDemand("foo", "bar"))
+	h.start()
+	c := h.synced(1)
+
+	h.assertFirstRequestRoutedVia(c, "foo", "foo")
+	h.assertFirstRequestRoutedVia(c, "bar", "bar")
+}
+
+// OnDemandVirtualHosts (VHDS): Envoy's route config has none of its own. Envoy holds the route config until it gets
+// virtual hosts under the route config's name, so a library sends some (here, all) to start, and the rest when Envoy
+// asks for one on the first request for its host. Either way, requests for each host get routed.
+func onDemandVirtualHosts(h *harness) {
+	h.cp.SetConfig(withVirtualHostsOnDemand(services("foo", "bar"), "foo", "bar"))
+	h.start()
+	c := h.synced(1)
+
+	for _, name := range []string{"foo", "bar"} {
+		// Unlike a held on-demand request, one for a virtual host sent ahead can race Envoy's workers getting it, so
+		// RoutedVia retries.
+		h.must(h.envoy.RoutedVia(h.ctx, dynamicListenerPort, name, name))
+		h.must(xdstest.WaitFor(10*time.Second, h.settled(c)))
+		h.must(h.checkpoint.Sane(h.ctx))
+	}
+}
+
 type harness struct {
 	t          *testing.T
 	ctx        context.Context
@@ -404,6 +482,9 @@ func (h *harness) start() {
 		if h.v.rateLimited {
 			bootstrap = rateLimited(h.t, bootstrap)
 		}
+		if h.v.noCDS {
+			bootstrap = withoutCDS(h.t, bootstrap)
+		}
 		h.envoy, err = xdstest.StartEnvoy(h.ctx, xdstest.EnvoyConfig{
 			Image: h.v.image, Bootstrap: bootstrap, ADSPort: adsPort, ListenerPorts: []int{listenerPort, dynamicListenerPort}, Args: []string{"-l", "debug"},
 		})
@@ -421,6 +502,15 @@ func rateLimited(t *testing.T, bootstrap []byte) []byte {
 		t.Fatal("couldn't add rate_limit_settings to Envoy's config")
 	}
 	return []byte(limited)
+}
+
+// withoutCDS removes cds_config from Envoy's config, so it subscribes to no clusters, only asking for them on demand.
+func withoutCDS(t *testing.T, bootstrap []byte) []byte {
+	const cds = "  cds_config:\n    ads: { }\n    resource_api_version: V3\n"
+	if !strings.Contains(string(bootstrap), cds) {
+		t.Fatal("couldn't remove cds_config from Envoy's config")
+	}
+	return []byte(strings.Replace(string(bootstrap), cds, "", 1))
 }
 
 // assertRateLimitedIfAsked checks a rate limited Envoy's reconnect burst hit the limit, or the option isn't testing
@@ -455,8 +545,12 @@ func (h *harness) synced(nth int) *xdstest.Conversation {
 		return nil
 	}))
 	c := h.rec.Conversations()[nth-1]
+	types := []string{xdstest.CDS, xdstest.LDS, xdstest.RDS} // what Envoy asks for as it starts
+	if h.v.noCDS {
+		types = types[1:]
+	}
 	h.must(xdstest.WaitFor(10*time.Second, func() error {
-		return errors.Join(h.checks(c).HadConversationsWith(xdstest.CDS, xdstest.LDS, xdstest.RDS), h.checks(c).AnsweredEveryType())
+		return errors.Join(h.checks(c).HadConversationsWith(types...), h.checks(c).AnsweredEveryType())
 	}))
 	h.must(xdstest.WaitFor(30*time.Second, h.settled(c)))
 	cp, err := xdstest.TakeCheckpoint(h.ctx, h.envoy, c)
@@ -481,14 +575,33 @@ func (h *harness) settled(c *xdstest.Conversation) func() error {
 
 func (h *harness) assertStatus(virtualHost string, want int) {
 	h.t.Helper()
+	h.assertStatusOn(listenerPort, virtualHost, want)
+}
+
+func (h *harness) assertStatusOn(port int, virtualHost string, want int) {
+	h.t.Helper()
 	// Envoy ACKs once its main thread has the config; workers get it a moment later.
 	h.must(xdstest.WaitFor(5*time.Second, func() error {
-		got, err := h.envoy.HTTPStatus(h.ctx, listenerPort, virtualHost)
+		got, err := h.envoy.HTTPStatus(h.ctx, port, virtualHost)
 		if err == nil && got != want {
 			err = fmt.Errorf("%s: status %d, want %d", virtualHost, got, want)
 		}
 		return err
 	}))
+}
+
+// assertFirstRequestRoutedVia: the first request for something Envoy gets on demand is held until it arrives, so it
+// succeeds first time, with no retrying. Then everything Envoy was sent for it must have been make before break.
+func (h *harness) assertFirstRequestRoutedVia(c *xdstest.Conversation, virtualHost, cluster string) {
+	h.t.Helper()
+	status, err := h.envoy.HTTPStatus(h.ctx, dynamicListenerPort, virtualHost)
+	h.must(err)
+	if status != 200 {
+		h.t.Fatalf("first request for %s: status %d, want 200", virtualHost, status)
+	}
+	h.must(xdstest.WaitFor(10*time.Second, h.settled(c)))
+	h.must(h.checkpoint.Sane(h.ctx))
+	h.must(h.envoy.RoutedVia(h.ctx, dynamicListenerPort, virtualHost, cluster))
 }
 
 // contained checks that there have been no rejections since the first NACK, and no reconnects.
@@ -580,27 +693,109 @@ func withEmptyCluster(config []proto.Message) []proto.Message {
 // withListener adds listener dynamic on port 10001, getting route config dynamic by RDS, whose virtual host dynamic
 // routes to cluster dynamic.
 func withListener(config []proto.Message) []proto.Message {
-	router, _ := anypb.New(&routerv3.Router{})
-	hcm, _ := anypb.New(&hcmv3.HttpConnectionManager{
-		StatPrefix: "dynamic",
-		RouteSpecifier: &hcmv3.HttpConnectionManager_Rds{Rds: &hcmv3.Rds{RouteConfigName: "dynamic", ConfigSource: &corev3.ConfigSource{
-			ResourceApiVersion:    corev3.ApiVersion_V3,
-			ConfigSourceSpecifier: &corev3.ConfigSource_Ads{Ads: &corev3.AggregatedConfigSource{}},
-		}}},
-		HttpFilters: []*hcmv3.HttpFilter{{Name: "envoy.filters.http.router", ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: router}}},
-	})
-	listener := &listenerv3.Listener{
-		Name: "dynamic",
+	return append(append([]proto.Message(nil), config...),
+		listener("dynamic", &hcmv3.HttpConnectionManager{
+			StatPrefix:     "dynamic",
+			RouteSpecifier: &hcmv3.HttpConnectionManager_Rds{Rds: &hcmv3.Rds{RouteConfigName: "dynamic", ConfigSource: ads()}},
+			HttpFilters:    []*hcmv3.HttpFilter{httpFilter("envoy.filters.http.router", &routerv3.Router{})},
+		}),
+		&routev3.RouteConfiguration{Name: "dynamic", VirtualHosts: []*routev3.VirtualHost{virtualHost("dynamic", "dynamic")}},
+		cluster("dynamic"), endpoints("dynamic"))
+}
+
+// withScopes adds listener scoped on port 10001, which picks a scope by the Host header, and for each name a scope of
+// that name whose route config scoped-name routes to the cluster of that name. On demand, Envoy only fetches a scope's
+// route config once a request needs it, held by the on-demand filter.
+func withScopes(config []proto.Message, onDemand bool, names ...string) []proto.Message {
+	var filters []*hcmv3.HttpFilter
+	if onDemand {
+		filters = append(filters, httpFilter(onDemandFilter, &ondemandv3.OnDemand{}))
+	}
+	hcm := &hcmv3.HttpConnectionManager{
+		StatPrefix: "scoped",
+		RouteSpecifier: &hcmv3.HttpConnectionManager_ScopedRoutes{ScopedRoutes: &hcmv3.ScopedRoutes{
+			Name: "scopes",
+			ScopeKeyBuilder: &hcmv3.ScopedRoutes_ScopeKeyBuilder{Fragments: []*hcmv3.ScopedRoutes_ScopeKeyBuilder_FragmentBuilder{{
+				Type: &hcmv3.ScopedRoutes_ScopeKeyBuilder_FragmentBuilder_HeaderValueExtractor_{
+					HeaderValueExtractor: &hcmv3.ScopedRoutes_ScopeKeyBuilder_FragmentBuilder_HeaderValueExtractor{
+						Name: ":authority", ElementSeparator: ":",
+						ExtractType: &hcmv3.ScopedRoutes_ScopeKeyBuilder_FragmentBuilder_HeaderValueExtractor_Index{Index: 0},
+					},
+				},
+			}}},
+			RdsConfigSource: ads(),
+			ConfigSpecifier: &hcmv3.ScopedRoutes_ScopedRds{ScopedRds: &hcmv3.ScopedRds{ScopedRdsConfigSource: ads()}},
+		}},
+		HttpFilters: append(filters, httpFilter("envoy.filters.http.router", &routerv3.Router{})),
+	}
+	scoped := append(append([]proto.Message(nil), config...), listener("scoped", hcm))
+	for _, name := range names {
+		scoped = append(scoped,
+			&routev3.ScopedRouteConfiguration{Name: name, RouteConfigurationName: "scoped-" + name, OnDemand: onDemand, Key: &routev3.ScopedRouteConfiguration_Key{
+				Fragments: []*routev3.ScopedRouteConfiguration_Key_Fragment{{Type: &routev3.ScopedRouteConfiguration_Key_Fragment_StringKey{StringKey: name}}},
+			}},
+			&routev3.RouteConfiguration{Name: "scoped-" + name, VirtualHosts: []*routev3.VirtualHost{virtualHost(name, name)}})
+	}
+	return scoped
+}
+
+// clustersOnDemand is listener on-demand on port 10001, whose route config on-demand routes each name to the cluster of
+// that name, plus those clusters and their endpoints, for an Envoy that only gets clusters when a request needs them.
+// The static listener's route config is empty.
+func clustersOnDemand(names ...string) []proto.Message {
+	odcds := &ondemandv3.OnDemand{Odcds: &ondemandv3.OnDemandCds{Source: ads(), Timeout: durationpb.New(5 * time.Second)}}
+	config := []proto.Message{&routev3.RouteConfiguration{Name: routes}, listener("on-demand", &hcmv3.HttpConnectionManager{
+		StatPrefix:     "on-demand",
+		RouteSpecifier: &hcmv3.HttpConnectionManager_Rds{Rds: &hcmv3.Rds{RouteConfigName: "on-demand", ConfigSource: ads()}},
+		HttpFilters:    []*hcmv3.HttpFilter{httpFilter(onDemandFilter, odcds), httpFilter("envoy.filters.http.router", &routerv3.Router{})},
+	})}
+	rc := &routev3.RouteConfiguration{Name: "on-demand"}
+	for _, name := range names {
+		config = append(config, cluster(name), endpoints(name))
+		rc.VirtualHosts = append(rc.VirtualHosts, virtualHost(name, name))
+	}
+	return append(config, rc)
+}
+
+// withVirtualHostsOnDemand adds listener vhds on port 10001, whose route config vhds has no virtual hosts of its own,
+// and for each name a VHDS virtual host vhds/name routing to the cluster of that name.
+func withVirtualHostsOnDemand(config []proto.Message, names ...string) []proto.Message {
+	withVhds := append(append([]proto.Message(nil), config...),
+		listener("vhds", &hcmv3.HttpConnectionManager{
+			StatPrefix:     "vhds",
+			RouteSpecifier: &hcmv3.HttpConnectionManager_Rds{Rds: &hcmv3.Rds{RouteConfigName: "vhds", ConfigSource: ads()}},
+			HttpFilters:    []*hcmv3.HttpFilter{httpFilter(onDemandFilter, &ondemandv3.OnDemand{}), httpFilter("envoy.filters.http.router", &routerv3.Router{})},
+		}),
+		&routev3.RouteConfiguration{Name: "vhds", Vhds: &routev3.Vhds{ConfigSource: ads()}})
+	for _, name := range names {
+		vh := virtualHost(name, name)
+		vh.Name = "vhds/" + name
+		withVhds = append(withVhds, vh)
+	}
+	return withVhds
+}
+
+// listener is a listener of this name on port 10001, with this HTTP connection manager.
+func listener(name string, hcm *hcmv3.HttpConnectionManager) *listenerv3.Listener {
+	typed, _ := anypb.New(hcm)
+	return &listenerv3.Listener{
+		Name: name,
 		Address: &corev3.Address{Address: &corev3.Address_SocketAddress{SocketAddress: &corev3.SocketAddress{
 			Address: "0.0.0.0", PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: dynamicListenerPort},
 		}}},
 		FilterChains: []*listenerv3.FilterChain{{Filters: []*listenerv3.Filter{{
-			Name: "envoy.filters.network.http_connection_manager", ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: hcm},
+			Name: "envoy.filters.network.http_connection_manager", ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: typed},
 		}}}},
 	}
-	return append(append([]proto.Message(nil), config...), listener,
-		&routev3.RouteConfiguration{Name: "dynamic", VirtualHosts: []*routev3.VirtualHost{virtualHost("dynamic", "dynamic")}},
-		cluster("dynamic"), endpoints("dynamic"))
+}
+
+func httpFilter(name string, config proto.Message) *hcmv3.HttpFilter {
+	typed, _ := anypb.New(config)
+	return &hcmv3.HttpFilter{Name: name, ConfigType: &hcmv3.HttpFilter_TypedConfig{TypedConfig: typed}}
+}
+
+func ads() *corev3.ConfigSource {
+	return &corev3.ConfigSource{ResourceApiVersion: corev3.ApiVersion_V3, ConfigSourceSpecifier: &corev3.ConfigSource_Ads{Ads: &corev3.AggregatedConfigSource{}}}
 }
 
 // service is a single virtual host routing to a cluster of a different name.
@@ -614,10 +809,7 @@ func cluster(name string) *clusterv3.Cluster {
 		Name:                 name,
 		ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_EDS},
 		ConnectTimeout:       durationpb.New(time.Second),
-		EdsClusterConfig: &clusterv3.Cluster_EdsClusterConfig{EdsConfig: &corev3.ConfigSource{
-			ResourceApiVersion:    corev3.ApiVersion_V3,
-			ConfigSourceSpecifier: &corev3.ConfigSource_Ads{Ads: &corev3.AggregatedConfigSource{}},
-		}},
+		EdsClusterConfig:     &clusterv3.Cluster_EdsClusterConfig{EdsConfig: ads()},
 	}
 }
 

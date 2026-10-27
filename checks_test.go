@@ -159,12 +159,63 @@ func TestSotwNonceEchoedFromThePreviousStream(t *testing.T) {
 
 func TestWildcardTypesAreTheOnesEnvoySubscribesToWithAWildcard(t *testing.T) {
 	// The xDS docs name only LDS and CDS, but Envoy's SRDS subscription also starts with no names:
-	// source/common/router/scoped_rds.h, subscription_->start({}).
+	// source/common/router/scoped_rds.h, subscription_->start({}). So does VHDS, which watches its route config's name
+	// as a namespace, and an empty answer only reaches wildcard watches (watch_map.cc).
 	for _, typeURL := range []string{LDS, RDS, SRDS, VHDS, CDS, EDS, SDS, RTDS} {
-		if want := typeURL == LDS || typeURL == CDS || typeURL == SRDS; IsWildcard(typeURL) != want {
+		if want := typeURL == LDS || typeURL == CDS || typeURL == SRDS || typeURL == VHDS; IsWildcard(typeURL) != want {
 			t.Errorf("IsWildcard(%s) = %v, want %v", typeURL, !want, want)
 		}
 	}
+}
+
+// syncedWithScope is Envoy synced with scope s naming route config rc, routing to cluster v1. Nonces 1 to 4.
+func syncedWithScope(t *testing.T) *Conversation {
+	c := NewConversation()
+	deltaExchange(t, c, CDS, "1", nil, edsCluster("v1"))
+	deltaExchange(t, c, EDS, "2", nil, &endpointv3.ClusterLoadAssignment{ClusterName: "v1"})
+	deltaExchange(t, c, SRDS, "3", nil, &routev3.ScopedRouteConfiguration{Name: "s", RouteConfigurationName: "rc"})
+	rc := routeTo("v1")
+	rc.Name = "rc"
+	deltaExchange(t, c, RDS, "4", nil, rc)
+	return c
+}
+
+func TestDeltaCatchesARouteConfigRemovedWhileAScopeUsesIt(t *testing.T) {
+	c := syncedWithScope(t)
+	deltaResponse(t, c, RDS, "5", []string{"rc"})
+	wantProblem(t, Delta(c).WasMakeBeforeBreak(0), `route config "rc" removed while Envoy's ACKed scoped route config "s" still uses it`)
+}
+
+func TestDeltaAllowsRemovingAClusterOnceTheScopeRoutingToItIsGone(t *testing.T) {
+	c := syncedWithScope(t)
+	deltaExchange(t, c, SRDS, "5", []string{"s"})
+	// before Envoy gets round to unsubscribing from rc
+	deltaExchange(t, c, CDS, "6", []string{"v1"})
+	if err := Delta(c).WasMakeBeforeBreak(0); err != nil {
+		t.Error(err)
+	}
+}
+
+func virtualHostTo(name, cluster string) *routev3.VirtualHost {
+	vh := routeTo(cluster).GetVirtualHosts()[0]
+	vh.Name = name
+	return vh
+}
+
+func TestDeltaCatchesAVirtualHostSentBeforeItsCluster(t *testing.T) {
+	c := NewConversation()
+	deltaExchange(t, c, CDS, "1", nil, edsCluster("v1"))
+	deltaResponse(t, c, VHDS, "2", nil, virtualHostTo("routes/foo", "v2"))
+	wantProblem(t, Delta(c).WasMakeBeforeBreak(0), `virtual host "routes/foo" sent using cluster "v2" before Envoy ACKed the cluster`)
+}
+
+func TestDeltaCatchesAClusterRemovedWhileAVirtualHostUsesIt(t *testing.T) {
+	c := NewConversation()
+	deltaExchange(t, c, CDS, "1", nil, edsCluster("v1"))
+	deltaExchange(t, c, EDS, "2", nil, &endpointv3.ClusterLoadAssignment{ClusterName: "v1"})
+	deltaExchange(t, c, VHDS, "3", nil, virtualHostTo("routes/foo", "v1"))
+	deltaResponse(t, c, CDS, "4", []string{"v1"})
+	wantProblem(t, Delta(c).WasMakeBeforeBreak(0), `cluster "v1" removed while Envoy's ACKed virtual host "routes/foo" still uses it`)
 }
 
 func TestMakeBeforeBreakFindsEndpointsUnderTheClustersEdsServiceName(t *testing.T) {
