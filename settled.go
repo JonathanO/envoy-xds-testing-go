@@ -71,17 +71,19 @@ func WaitFor(timeout time.Duration, check func() error) error {
 
 // allAnswered checks that every response nonce was ACKed or NACKed.
 func allAnswered(c *Conversation) error {
-	unanswered := map[string]bool{}
+	// By type: Envoy keeps nonces per type, so a library may number them per type.
+	type typeNonce struct{ typeURL, nonce string }
+	unanswered := map[typeNonce]bool{}
 	for _, m := range c.Messages() {
 		switch m := m.(type) {
 		case *discoveryv3.DiscoveryResponse:
-			unanswered[m.GetNonce()] = true
+			unanswered[typeNonce{m.GetTypeUrl(), m.GetNonce()}] = true
 		case *discoveryv3.DeltaDiscoveryResponse:
-			unanswered[m.GetNonce()] = true
+			unanswered[typeNonce{m.GetTypeUrl(), m.GetNonce()}] = true
 		case *discoveryv3.DiscoveryRequest:
-			delete(unanswered, m.GetResponseNonce())
+			delete(unanswered, typeNonce{m.GetTypeUrl(), m.GetResponseNonce()})
 		case *discoveryv3.DeltaDiscoveryRequest:
-			delete(unanswered, m.GetResponseNonce())
+			delete(unanswered, typeNonce{m.GetTypeUrl(), m.GetResponseNonce()})
 		}
 	}
 	if len(unanswered) > 0 {
