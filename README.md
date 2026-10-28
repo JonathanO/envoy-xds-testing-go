@@ -318,7 +318,8 @@ logged no warnings. To record a known deviation, add it to `Options.Skip`, with 
 path, so `"sotw/ChangesWhileDisconnected"` skips that scenario on SotW, on every version and mode.
 
 Envoy's config uses node id `test-envoy-0` and cluster `test-cluster`. Each test's control plane listens on a free
-port, so tests can run in parallel.
+port, so tests run in parallel, each with its own Envoy, as many at once as `go test -parallel` allows (by default
+GOMAXPROCS). `New` is called concurrently: if the control planes it returns share state, set `Options.Serial`.
 
 ## Examples
 
@@ -328,6 +329,8 @@ it; just drop the `replace` line from its `go.mod`. They need Docker. Run one fr
 ```sh
 cd examples/controlplane && go test ./...
 ```
+
+Their tests run in parallel, each with its own Envoy; `go test -parallel 4 ./...` runs at most four at once.
 
 - [`controlplane`](examples/controlplane): testing your own control plane, as in "A test" above.
 - [`conformance`](examples/conformance): the conformance suite against go-control-plane. It's expected to fail.
