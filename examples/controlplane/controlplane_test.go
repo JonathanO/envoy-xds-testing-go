@@ -28,9 +28,16 @@ import (
 )
 
 func TestMovingAServiceToNewEndpoints(t *testing.T) {
-	// The same test for each protocol: only Envoy's config and the checks differ.
-	t.Run("sotw", func(t *testing.T) { movingAServiceToNewEndpoints(t, "testdata/envoy-sotw.yaml", xdstest.Sotw) })
-	t.Run("delta", func(t *testing.T) { movingAServiceToNewEndpoints(t, "testdata/envoy-delta.yaml", xdstest.Delta) })
+	// The same test for each protocol: only Envoy's config and the checks differ. Each has its own Envoy and server, on
+	// a free port, so they run in parallel.
+	t.Run("sotw", func(t *testing.T) {
+		t.Parallel()
+		movingAServiceToNewEndpoints(t, "testdata/envoy-sotw.yaml", xdstest.Sotw)
+	})
+	t.Run("delta", func(t *testing.T) {
+		t.Parallel()
+		movingAServiceToNewEndpoints(t, "testdata/envoy-delta.yaml", xdstest.Delta)
+	})
 }
 
 func movingAServiceToNewEndpoints(t *testing.T, bootstrapFile string, checksFor func(*xdstest.Conversation) xdstest.Checks) {

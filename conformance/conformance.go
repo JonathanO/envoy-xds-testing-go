@@ -82,6 +82,9 @@ type Options struct {
 	// delta), Envoy version (v1.36), mode (normal, rate-limited) and scenario (ChangesWhileDisconnected), joined by "/".
 	// "sotw/ChangesWhileDisconnected" skips that scenario on SotW everywhere.
 	Skip map[string]string
+	// Serial runs one test at a time, e.g. if the control planes New returns share state. Otherwise tests run in
+	// parallel, each with its own Envoy, as many at once as go test's -parallel flag allows (by default GOMAXPROCS).
+	Serial bool
 }
 
 // variant is one place in the matrix.
@@ -108,7 +111,7 @@ var (
 
 // Run runs every scenario as subtests of t: on each protocol, on each of the Envoy images, normally and with Envoy's requests
 // rate limited, e.g. t/sotw/v1.36/rate-limited/StartsEmpty. Each test's control plane listens on a free port, so tests
-// can run in parallel.
+// run in parallel, unless Options.Serial.
 func Run(t *testing.T, o Options) {
 	tests := []struct {
 		name          string
@@ -143,22 +146,32 @@ func Run(t *testing.T, o Options) {
 	if len(images) == 0 {
 		images = EnvoyImages
 	}
+	// At every level: a test that isn't parallel holds up its siblings until its own subtests finish.
+	parallel := func(t *testing.T) {
+		if !o.Serial {
+			t.Parallel()
+		}
+	}
 	for _, protocol := range protocols {
 		t.Run(string(protocol), func(t *testing.T) {
+			parallel(t)
 			for _, image := range images {
 				version := strings.TrimSuffix(image[strings.LastIndex(image, ":")+1:], "-latest")
 				t.Run(version, func(t *testing.T) {
+					parallel(t)
 					for _, rateLimited := range []bool{false, true} {
 						mode := "normal"
 						if rateLimited {
 							mode = "rate-limited"
 						}
 						t.Run(mode, func(t *testing.T) {
+							parallel(t)
 							for _, test := range tests {
 								if test.protocols != nil && !slices.Contains(test.protocols, protocol) {
 									continue
 								}
 								t.Run(test.name, func(t *testing.T) {
+									parallel(t)
 									if reason, ok := deviation(o.Skip, string(protocol), version, mode, test.name); ok {
 										t.Skip(reason)
 									}
