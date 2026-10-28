@@ -584,6 +584,18 @@ func (h *harness) synced(nth int) *xdstest.Conversation {
 	h.must(xdstest.WaitFor(10*time.Second, func() error {
 		return errors.Join(h.checks(c).HadConversationsWith(types...), h.checks(c).AnsweredEveryType())
 	}))
+	// A warming listener isn't listening yet, so a first request would be reset. Its last subscription, e.g. SRDS, can
+	// still be queued in Envoy when everything sent so far is ACKed and the control plane looks idle.
+	h.must(xdstest.WaitFor(10*time.Second, func() error {
+		stats, err := h.envoy.Stats(h.ctx)
+		if err != nil {
+			return err
+		}
+		if n := stats["listener_manager.total_listeners_warming"]; n != 0 {
+			return fmt.Errorf("%d listeners still warming", n)
+		}
+		return nil
+	}))
 	h.must(xdstest.WaitFor(30*time.Second, h.settled(c)))
 	cp, err := xdstest.TakeCheckpoint(h.ctx, h.envoy, c)
 	h.must(err)
