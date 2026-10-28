@@ -28,6 +28,9 @@ import (
 // AdminPort is where Envoy's config must put its admin interface, on 0.0.0.0.
 const AdminPort = 9901
 
+// ADSPortPlaceholder is replaced in Envoy's bootstrap with EnvoyConfig.ADSPort, e.g. "port_value: ${ADS_PORT}".
+const ADSPortPlaceholder = "${ADS_PORT}"
+
 // HostInternal is the name Envoy's config uses to reach your control plane on the host, e.g. in the ADS cluster.
 const HostInternal = testcontainers.HostInternal
 
@@ -36,10 +39,10 @@ type EnvoyConfig struct {
 	// Image is the Envoy image, e.g. "envoyproxy/envoy:v1.40-latest".
 	Image string
 	// Bootstrap is Envoy's YAML config. It must put the admin interface on 0.0.0.0:9901 and point ADS at
-	// HostInternal on ADSPort.
+	// HostInternal on ADSPortPlaceholder, which is replaced with ADSPort.
 	Bootstrap []byte
 	// ADSPort is the port your control plane listens on, on the host. Start it before Envoy, or Envoy backs off and
-	// can time out its initial fetches.
+	// can time out its initial fetches. Listen on ":0" and pass the port it got, so tests can run in parallel.
 	ADSPort int
 	// ListenerPorts are listener ports to reach from the test, e.g. with HTTPStatus. Bind those listeners to 0.0.0.0.
 	ListenerPorts []int
@@ -74,13 +77,14 @@ func startEnvoy(ctx context.Context, cfg EnvoyConfig) (*Envoy, error) {
 	for _, p := range cfg.ListenerPorts {
 		exposed = append(exposed, fmt.Sprintf("%d/tcp", p))
 	}
+	bootstrap := bytes.ReplaceAll(cfg.Bootstrap, []byte(ADSPortPlaceholder), []byte(strconv.Itoa(cfg.ADSPort)))
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
 			Image:           cfg.Image,
 			Cmd:             append([]string{"-c", "/envoy.yaml"}, cfg.Args...),
 			ExposedPorts:    exposed,
 			HostAccessPorts: []int{cfg.ADSPort},
-			Files:           []testcontainers.ContainerFile{{Reader: bytes.NewReader(cfg.Bootstrap), ContainerFilePath: "/envoy.yaml", FileMode: 0o644}},
+			Files:           []testcontainers.ContainerFile{{Reader: bytes.NewReader(bootstrap), ContainerFilePath: "/envoy.yaml", FileMode: 0o644}},
 			WaitingFor:      wait.ForHTTP("/server_info").WithPort(fmt.Sprintf("%d/tcp", AdminPort)).WithStartupTimeout(time.Minute),
 			LogConsumerCfg:  &testcontainers.LogConsumerConfig{Consumers: []testcontainers.LogConsumer{e}},
 		},

@@ -31,7 +31,7 @@ static_resources:
                   address:
                     socket_address:
                       address: "host.testcontainers.internal"
-                      port_value: 6566
+                      port_value: ${ADS_PORT} # the control plane's port, filled in by the test
       lb_policy: RANDOM
       http2_protocol_options: { }
       upstream_connection_options:
