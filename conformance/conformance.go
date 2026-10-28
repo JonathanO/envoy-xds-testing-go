@@ -697,6 +697,17 @@ func (h *harness) assertRoutedToEndpoints(name string, addresses ...string) {
 // succeeds first time, with no retrying. Then everything Envoy was sent for it must have been make before break.
 func (h *harness) assertFirstRequestRoutedVia(c *xdstest.Conversation, virtualHost, cluster string) {
 	h.t.Helper()
+	// Nothing listens until Envoy starts its workers, which it does after its first listeners have warmed.
+	h.must(xdstest.WaitFor(10*time.Second, func() error {
+		stats, err := h.envoy.Stats(h.ctx)
+		if err != nil {
+			return err
+		}
+		if stats["listener_manager.workers_started"] != 1 {
+			return errors.New("Envoy hasn't started its workers")
+		}
+		return nil
+	}))
 	status, err := h.envoy.HTTPStatus(h.ctx, dynamicListenerPort, virtualHost)
 	h.must(err)
 	if status != 200 {
