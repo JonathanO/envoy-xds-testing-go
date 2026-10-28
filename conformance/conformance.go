@@ -93,7 +93,6 @@ type variant struct {
 }
 
 const (
-	adsPort             = 6566
 	listenerPort        = 10000
 	dynamicListenerPort = 10001        // the listener AddsAndRemovesListener adds
 	routes              = "all_routes" // Envoy's static listener asks for this
@@ -108,8 +107,8 @@ var (
 )
 
 // Run runs every scenario as subtests of t: on each protocol, on each of the Envoy images, normally and with Envoy's requests
-// rate limited, e.g. t/sotw/v1.36/rate-limited/StartsEmpty. Envoy connects to port 6566 on the host, so don't run it in
-// parallel.
+// rate limited, e.g. t/sotw/v1.36/rate-limited/StartsEmpty. Each test's control plane listens on a free port, so tests
+// can run in parallel.
 func Run(t *testing.T, o Options) {
 	tests := []struct {
 		name          string
@@ -471,6 +470,7 @@ type harness struct {
 	newCP      func(*testing.T) ControlPlane
 	rec        *xdstest.Recorder
 	server     *grpc.Server
+	adsPort    int // the control plane's port, picked on the first start; 0 until then
 	envoy      *xdstest.Envoy
 	checkpoint *xdstest.Checkpoint
 }
@@ -501,8 +501,10 @@ func (h *harness) must(err error) {
 // timeout.
 func (h *harness) start() {
 	h.t.Helper()
-	lis, err := net.Listen("tcp", ":"+strconv.Itoa(adsPort))
+	lis, err := net.Listen("tcp", ":"+strconv.Itoa(h.adsPort))
 	h.must(err)
+	// A free port, kept for restarts: Envoy's bootstrap names it.
+	h.adsPort = lis.Addr().(*net.TCPAddr).Port
 	h.server = grpc.NewServer(grpc.StreamInterceptor(h.rec.Intercept))
 	h.cp.Register(h.server)
 	go func() { _ = h.server.Serve(lis) }()
@@ -518,7 +520,7 @@ func (h *harness) start() {
 			bootstrap = withoutCDS(h.t, bootstrap)
 		}
 		h.envoy, err = xdstest.StartEnvoy(h.ctx, xdstest.EnvoyConfig{
-			Image: h.v.image, Bootstrap: bootstrap, ADSPort: adsPort, ListenerPorts: []int{listenerPort, dynamicListenerPort}, Args: []string{"-l", "debug"},
+			Image: h.v.image, Bootstrap: bootstrap, ADSPort: h.adsPort, ListenerPorts: []int{listenerPort, dynamicListenerPort}, Args: []string{"-l", "debug"},
 		})
 		h.must(err)
 	}

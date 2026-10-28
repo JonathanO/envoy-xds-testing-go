@@ -18,7 +18,8 @@ This is a Go port of `envoy-xds-testing` from [java-envoy-xds](https://github.co
 go get github.com/JonathanO/envoy-xds-testing-go
 ```
 
-You also need Docker. The protos are go-control-plane's (`github.com/envoyproxy/go-control-plane/envoy`).
+You also need Docker, or another [container runtime](#container-runtimes). The protos are go-control-plane's
+(`github.com/envoyproxy/go-control-plane/envoy`).
 
 What's in it:
 
@@ -36,6 +37,24 @@ What's in it:
 - Package `match`: composable matchers for resources, messages, the order things happened in, and what Envoy holds.
 - Package `conformance`: the conformance suite.
 
+### Container runtimes
+
+Anything [testcontainers-go supports](https://golang.testcontainers.org/system_requirements/docker/) should do:
+
+- Docker Engine on Linux, or Docker Desktop on macOS or Windows: works as is.
+- [Rancher Desktop](https://golang.testcontainers.org/system_requirements/rancher/): set its engine to dockerd (moby),
+  not containerd, and on macOS the other settings on that page.
+- [Podman](https://golang.testcontainers.org/system_requirements/using_podman/): set `DOCKER_HOST` to its
+  Docker-compatible socket, e.g. `unix://$XDG_RUNTIME_DIR/podman/podman.sock`, and start it with
+  `systemctl --user start podman.socket`. Where Ryuk can't start, as on macOS, run it privileged
+  (`TESTCONTAINERS_RYUK_CONTAINER_PRIVILEGED=true`, or `ryuk.container.privileged=true` in
+  `~/.testcontainers.properties`, with a rootful Podman machine), or disable it (`TESTCONTAINERS_RYUK_DISABLED=true`).
+
+Envoy reaches your control plane at `host.testcontainers.internal`, through
+[testcontainers-go's SSH tunnel to the host](https://golang.testcontainers.org/features/networking/#exposing-host-ports-to-the-container),
+not Docker's own route to the host, which differs by platform. So it needs nothing more of the runtime than the rest of
+testcontainers-go does, whether the runtime runs in a VM or not.
+
 Every check returns an `error` rather than taking a `*testing.T`, so it works with `WaitFor` and with whatever
 assertions you use.
 
@@ -48,7 +67,8 @@ Write a bootstrap config for the Envoy under test. The suite's
 start. It must:
 
 - put the admin interface on `0.0.0.0:9901`;
-- point ADS at `host.testcontainers.internal` (`xdstest.HostInternal`) on your gRPC server's port;
+- point ADS at `host.testcontainers.internal` (`xdstest.HostInternal`), on port `${ADS_PORT}`, which `StartEnvoy`
+  fills in with `ADSPort`;
 - bind any listener you send traffic through to `0.0.0.0`, or it can't be reached from the test;
 - use the node id and cluster that your control plane expects.
 
@@ -69,7 +89,8 @@ func TestAddsAService(t *testing.T) {
 	rec := &xdstest.Recorder{}
 	server := grpc.NewServer(grpc.StreamInterceptor(rec.Intercept))
 	controlPlane.Register(server)
-	lis, err := net.Listen("tcp", ":6566")
+	// On a free port, so tests can run in parallel.
+	lis, err := net.Listen("tcp", ":0")
 	must(t, err)
 	go server.Serve(lis)
 	t.Cleanup(server.Stop)
@@ -77,7 +98,8 @@ func TestAddsAService(t *testing.T) {
 	bootstrap, err := os.ReadFile("testdata/envoy.yaml")
 	must(t, err)
 	envoy, err := xdstest.StartEnvoy(ctx, xdstest.EnvoyConfig{
-		Image: "envoyproxy/envoy:v1.40-latest", Bootstrap: bootstrap, ADSPort: 6566, ListenerPorts: []int{10000},
+		Image: "envoyproxy/envoy:v1.40-latest", Bootstrap: bootstrap, ADSPort: lis.Addr().(*net.TCPAddr).Port,
+		ListenerPorts: []int{10000},
 	})
 	must(t, err)
 	t.Cleanup(func() { envoy.Terminate(context.Background()) })
@@ -196,7 +218,7 @@ conversation before it: Envoy keeps its config across the disconnect, so make be
 
 - Each Envoy start costs a few seconds, and the first, which pulls the image, much more. Add checks to the scenarios
   you have before adding new scenarios.
-- Envoy connects to a fixed port, so don't run these tests in parallel.
+- Envoy connects to whichever `ADSPort` you give it, so tests on free ports can run in parallel.
 - Take a `Checkpoint` after Envoy has synced. Then checks only look at what happened since.
 
 ## Conformance suite for xDS libraries
@@ -295,7 +317,8 @@ unasked, there were no empty responses, and changes were make before break. It a
 logged no warnings. To record a known deviation, add it to `Options.Skip`, with the reason. Keys are parts of a test's
 path, so `"sotw/ChangesWhileDisconnected"` skips that scenario on SotW, on every version and mode.
 
-Envoy's config uses node id `test-envoy-0` and cluster `test-cluster`, and Envoy connects to port 6566 on the host.
+Envoy's config uses node id `test-envoy-0` and cluster `test-cluster`. Each test's control plane listens on a free
+port, so tests can run in parallel.
 
 ## Examples
 

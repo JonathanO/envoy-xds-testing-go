@@ -42,7 +42,8 @@ func movingAServiceToNewEndpoints(t *testing.T, bootstrapFile string, checksFor 
 	rec := &xdstest.Recorder{}
 	server := grpc.NewServer(grpc.StreamInterceptor(rec.Intercept))
 	discoveryv3.RegisterAggregatedDiscoveryServiceServer(server, gcpserver.NewServer(ctx, snapshots, nil))
-	lis, err := net.Listen("tcp", ":6566")
+	// On a free port, so tests can run in parallel.
+	lis, err := net.Listen("tcp", ":0")
 	must(t, err)
 	go server.Serve(lis)
 	t.Cleanup(server.Stop)
@@ -50,7 +51,8 @@ func movingAServiceToNewEndpoints(t *testing.T, bootstrapFile string, checksFor 
 	bootstrap, err := os.ReadFile(bootstrapFile)
 	must(t, err)
 	envoy, err := xdstest.StartEnvoy(ctx, xdstest.EnvoyConfig{
-		Image: "envoyproxy/envoy:v1.40-latest", Bootstrap: bootstrap, ADSPort: 6566, ListenerPorts: []int{10000},
+		Image: "envoyproxy/envoy:v1.40-latest", Bootstrap: bootstrap, ADSPort: lis.Addr().(*net.TCPAddr).Port,
+		ListenerPorts: []int{10000},
 	})
 	must(t, err)
 	t.Cleanup(func() { envoy.Terminate(context.Background()) })
