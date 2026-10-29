@@ -381,7 +381,7 @@ func churns(h *harness) {
 	h.must(h.checkpoint.Sane(h.ctx))
 	h.must(h.envoy.RoutedVia(h.ctx, listenerPort, "foo", "foo-v20"))
 	h.must(xdstest.WaitFor(60*time.Second, func() error {
-		dump, err := h.envoy.ConfigDump(h.ctx, "?resource=dynamic_active_clusters")
+		dump, err := h.envoy.ConfigDump(h.ctx, "")
 		if err != nil {
 			return err
 		}
