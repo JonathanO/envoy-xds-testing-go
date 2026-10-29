@@ -599,11 +599,10 @@ func (h *harness) synced(nth int) *xdstest.Conversation {
 	h.must(xdstest.WaitFor(10*time.Second, func() error {
 		return errors.Join(h.checks(c).HadConversationsWith(types...), h.checks(c).AnsweredEveryType())
 	}))
-	// A listener that's still waiting for config, e.g. its routes, isn't listening yet, so a first request would be
-	// reset, and its last subscription can still be queued in Envoy when everything sent so far is ACKed and the
-	// control plane looks idle: rate limiting spaces Envoy's requests out. Listeners Envoy started with count as
-	// warming only once its workers have started, which they do when those listeners are ready. So look for both once
-	// settled, when Envoy has applied everything it was sent: before then, it may not have applied a listener yet.
+	// A warming listener isn't listening yet, so a first request would be reset. Its last subscription, e.g. SRDS, can
+	// still be queued in Envoy when everything sent so far is ACKed and the control plane looks idle: rate limiting
+	// spaces Envoy's requests out, so wait for its queue to empty too. Look once settled, when Envoy has applied
+	// everything it was sent: before then, it may not have applied the listener yet, and none is warming.
 	settled := h.settled(c)
 	h.must(xdstest.WaitFor(30*time.Second, func() error {
 		if err := settled(); err != nil {
@@ -613,8 +612,8 @@ func (h *harness) synced(nth int) *xdstest.Conversation {
 		if err != nil {
 			return err
 		}
-		if stats["listener_manager.workers_started"] != 1 {
-			return errors.New("Envoy hasn't started its workers")
+		if n := stats["control_plane.pending_requests"]; n != 0 {
+			return fmt.Errorf("%d requests queued in Envoy", n)
 		}
 		if n := stats["listener_manager.total_listeners_warming"]; n != 0 {
 			return fmt.Errorf("%d listeners still warming", n)
@@ -712,8 +711,8 @@ func (h *harness) assertFirstRequestRoutedVia(c *xdstest.Conversation, virtualHo
 		if err != nil {
 			return err
 		}
-		if stats["listener_manager.workers_started"] != 1 {
-			return errors.New("Envoy hasn't started its workers")
+		if n := stats["control_plane.pending_requests"]; n != 0 {
+			return fmt.Errorf("%d requests queued in Envoy", n)
 		}
 		return nil
 	}))
