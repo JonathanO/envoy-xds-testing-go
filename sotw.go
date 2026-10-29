@@ -230,6 +230,23 @@ func replaySotw(state *ackedState, messages []proto.Message, checkFrom int) erro
 	return nil
 }
 
+func (s sotw) AskedForEveryRouteConfigInUse() error {
+	state := newAckedState()
+	if err := replaySotw(state, s.c.Messages(), -1); err != nil {
+		return err
+	}
+	asked := map[string]bool{} // by Envoy's last RDS request, which lists them all
+	for _, m := range s.c.Messages() {
+		if r, ok := m.(*discoveryv3.DiscoveryRequest); ok && r.GetTypeUrl() == RDS {
+			asked = map[string]bool{}
+			for _, name := range r.GetResourceNames() {
+				asked[name] = true
+			}
+		}
+	}
+	return state.askedForRouteConfigsInUse(asked)
+}
+
 func (s sotw) AnsweredEveryType() error {
 	return answeredEveryType(s.c)
 }

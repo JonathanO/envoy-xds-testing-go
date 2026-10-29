@@ -6,7 +6,9 @@ import (
 
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	hcmv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	discoveryv3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -279,4 +281,31 @@ func TestDeltaDoesNotTakeAnAckOfAnotherTypesNonce(t *testing.T) {
 		t.Error(err)
 	}
 	wantProblem(t, Delta(c).WasMakeBeforeBreak(0), `route "routes" sent using cluster "b" before Envoy ACKed the cluster`)
+}
+
+// rdsListener is a listener that gets its routes, the route config named routes, by RDS.
+func rdsListener(t *testing.T, name string) *listenerv3.Listener {
+	hcm := &hcmv3.HttpConnectionManager{RouteSpecifier: &hcmv3.HttpConnectionManager_Rds{Rds: &hcmv3.Rds{RouteConfigName: "routes"}}}
+	return &listenerv3.Listener{Name: name, FilterChains: []*listenerv3.FilterChain{{Filters: []*listenerv3.Filter{{
+		Name: "http", ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: anyOf(t, hcm)}}}}}}
+}
+
+func TestAskedForEveryRouteConfigInUseWaitsForTheRoutesOfAListenerEnvoyACKed(t *testing.T) {
+	sotw := &Conversation{}
+	sotw.Add(&discoveryv3.DiscoveryRequest{TypeUrl: LDS})
+	sotwExchange(t, sotw, LDS, "1", rdsListener(t, "l"))
+	delta := &Conversation{}
+	delta.Add(&discoveryv3.DeltaDiscoveryRequest{TypeUrl: LDS})
+	deltaExchange(t, delta, LDS, "1", nil, rdsListener(t, "l"))
+	for _, c := range []*Conversation{sotw, delta} {
+		wantProblem(t, ChecksFor(c).AskedForEveryRouteConfigInUse(), `envoy hasn't asked for route config "routes" of listener "l"`)
+	}
+
+	sotw.Add(&discoveryv3.DiscoveryRequest{TypeUrl: RDS, ResourceNames: []string{"routes"}})
+	delta.Add(&discoveryv3.DeltaDiscoveryRequest{TypeUrl: RDS, ResourceNamesSubscribe: []string{"routes"}})
+	for name, c := range map[string]*Conversation{"sotw": sotw, "delta": delta} {
+		if err := ChecksFor(c).AskedForEveryRouteConfigInUse(); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
 }
