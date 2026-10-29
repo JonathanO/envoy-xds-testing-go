@@ -197,6 +197,22 @@ func (s *ackedState) dropIfUnused(routeConfig string) {
 	delete(s.routes, routeConfig)
 }
 
+// askedForRouteConfigsInUse checks that every route config an ACKed listener uses is one Envoy asked for.
+func (s *ackedState) askedForRouteConfigsInUse(asked map[string]bool) error {
+	var missing []string
+	for _, listener := range sortedKeys(boolKeys(s.listeners)) {
+		for _, r := range sortedKeys(s.listeners[listener]) {
+			if !asked[r] {
+				missing = append(missing, fmt.Sprintf("route config %q of listener %q", r, listener))
+			}
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("envoy hasn't asked for %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
 // routeConfigsUsed are the route configs a listener's HTTP connection managers get by RDS.
 func routeConfigsUsed(listener *listenerv3.Listener) (map[string]bool, error) {
 	used := map[string]bool{}
