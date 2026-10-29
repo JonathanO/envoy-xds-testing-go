@@ -599,10 +599,11 @@ func (h *harness) synced(nth int) *xdstest.Conversation {
 	h.must(xdstest.WaitFor(10*time.Second, func() error {
 		return errors.Join(h.checks(c).HadConversationsWith(types...), h.checks(c).AnsweredEveryType())
 	}))
-	// A warming listener isn't listening yet, so a first request would be reset. Its last subscription, e.g. SRDS, can
-	// still be queued in Envoy when everything sent so far is ACKed and the control plane looks idle: rate limiting
-	// spaces Envoy's requests out. So look for warming listeners once settled, when Envoy has applied everything it was
-	// sent: before then, it may not have applied the listener yet, and none is warming.
+	// A listener that's still waiting for config, e.g. its routes, isn't listening yet, so a first request would be
+	// reset, and its last subscription can still be queued in Envoy when everything sent so far is ACKed and the
+	// control plane looks idle: rate limiting spaces Envoy's requests out. Listeners Envoy started with count as
+	// warming only once its workers have started, which they do when those listeners are ready. So look for both once
+	// settled, when Envoy has applied everything it was sent: before then, it may not have applied a listener yet.
 	settled := h.settled(c)
 	h.must(xdstest.WaitFor(30*time.Second, func() error {
 		if err := settled(); err != nil {
@@ -611,6 +612,9 @@ func (h *harness) synced(nth int) *xdstest.Conversation {
 		stats, err := h.envoy.Stats(h.ctx)
 		if err != nil {
 			return err
+		}
+		if stats["listener_manager.workers_started"] != 1 {
+			return errors.New("Envoy hasn't started its workers")
 		}
 		if n := stats["listener_manager.total_listeners_warming"]; n != 0 {
 			return fmt.Errorf("%d listeners still warming", n)
