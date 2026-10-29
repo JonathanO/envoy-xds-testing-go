@@ -600,8 +600,14 @@ func (h *harness) synced(nth int) *xdstest.Conversation {
 		return errors.Join(h.checks(c).HadConversationsWith(types...), h.checks(c).AnsweredEveryType())
 	}))
 	// A warming listener isn't listening yet, so a first request would be reset. Its last subscription, e.g. SRDS, can
-	// still be queued in Envoy when everything sent so far is ACKed and the control plane looks idle.
-	h.must(xdstest.WaitFor(10*time.Second, func() error {
+	// still be queued in Envoy when everything sent so far is ACKed and the control plane looks idle: rate limiting
+	// spaces Envoy's requests out. So look for warming listeners once settled, when Envoy has applied everything it was
+	// sent: before then, it may not have applied the listener yet, and none is warming.
+	settled := h.settled(c)
+	h.must(xdstest.WaitFor(30*time.Second, func() error {
+		if err := settled(); err != nil {
+			return err
+		}
 		stats, err := h.envoy.Stats(h.ctx)
 		if err != nil {
 			return err
@@ -611,7 +617,6 @@ func (h *harness) synced(nth int) *xdstest.Conversation {
 		}
 		return nil
 	}))
-	h.must(xdstest.WaitFor(30*time.Second, h.settled(c)))
 	cp, err := xdstest.TakeCheckpoint(h.ctx, h.envoy, c)
 	h.must(err)
 	h.checkpoint = cp
