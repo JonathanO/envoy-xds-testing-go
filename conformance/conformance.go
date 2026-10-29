@@ -711,8 +711,8 @@ func (h *harness) assertFirstRequestRoutedVia(c *xdstest.Conversation, virtualHo
 		if err != nil {
 			return err
 		}
-		if n := stats["control_plane.pending_requests"]; n != 0 {
-			return fmt.Errorf("%d requests queued in Envoy", n)
+		if stats["listener_manager.workers_started"] != 1 {
+			return errors.New("Envoy hasn't started its workers")
 		}
 		return nil
 	}))
