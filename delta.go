@@ -193,6 +193,25 @@ func replayDelta(state *ackedState, messages []proto.Message, checkFrom int) err
 	return nil
 }
 
+func (d delta) AskedForEveryRouteConfigInUse() error {
+	state := newAckedState()
+	if err := replayDelta(state, d.c.Messages(), -1); err != nil {
+		return err
+	}
+	asked := map[string]bool{}
+	for _, m := range d.c.Messages() {
+		if r, ok := m.(*discoveryv3.DeltaDiscoveryRequest); ok && r.GetTypeUrl() == RDS {
+			for _, name := range r.GetResourceNamesSubscribe() {
+				asked[name] = true
+			}
+			for _, name := range r.GetResourceNamesUnsubscribe() {
+				delete(asked, name)
+			}
+		}
+	}
+	return state.askedForRouteConfigsInUse(asked)
+}
+
 func (d delta) AnsweredEveryType() error {
 	return answeredEveryType(d.c)
 }

@@ -35,6 +35,11 @@ type Checks interface {
 	// checks this one from fromMessage on, usually 0.
 	WasMakeBeforeBreakAfter(before *Conversation, fromMessage int) error
 
+	// AskedForEveryRouteConfigInUse checks that Envoy subscribed to the route config of every listener it ACKed. Until
+	// it has, it hasn't synced, though it may look done: a rate limited Envoy can ACK a listener well before it asks
+	// for the listener's routes.
+	AskedForEveryRouteConfigInUse() error
+
 	// AnsweredEveryType checks that every type Envoy asked for got at least one response. Without one Envoy waits out
 	// its initial fetch timeout, or forever if that is disabled.
 	AnsweredEveryType() error
