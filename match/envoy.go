@@ -10,7 +10,8 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// ActiveClusters returns Envoy's active dynamic clusters from a config dump.
+// ActiveClusters returns Envoy's active dynamic clusters from a config dump that has its clusters section: the whole
+// dump, not one filtered with ?resource=, which lists clusters on their own.
 func ActiveClusters(dump *adminv3.ConfigDump) ([]*clusterv3.Cluster, error) {
 	var clusters []*clusterv3.Cluster
 	for _, a := range dump.GetConfigs() {
