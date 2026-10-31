@@ -2,15 +2,14 @@
 
 Test an xDS control plane against a real Envoy, run in Docker with
 [testcontainers-go](https://golang.testcontainers.org/). It works for any Go control plane, whichever xDS library it
-uses. There are two ways to use it:
+uses: write your own scenarios ("service X loses an instance"), and check that Envoy ends up where it should, safely.
 
-- [Testing your control plane](#testing-your-control-plane): write your own scenarios ("service X loses an
-  instance"), and check that Envoy ends up where it should, safely.
-- [Conformance suite for xDS libraries](#conformance-suite-for-xds-libraries): check that a library serves any given
-  config correctly.
+To check that an xDS library serves any given config correctly, use the conformance suite in
+[envoy-xds-spec](https://github.com/JonathanO/envoy-xds-spec/blob/main/docs/CONFORMANCE.md) instead. It runs against a
+small conformance server for any language, so every port of the library runs the same one.
 
-This is a Go port of `envoy-xds-testing` from [java-envoy-xds](https://github.com/JonathanO/java-envoy-xds).
-[`examples/`](examples) has both, working against upstream go-control-plane.
+These helpers are a Go port of the conformance harness in envoy-xds-spec. [`examples/`](examples) has them working
+against upstream go-control-plane.
 
 ## Setup
 
@@ -35,7 +34,6 @@ What's in it:
 - `Checkpoint`: marks a conversation, Envoy's log and its stats, and checks everything since in one call.
 - `Envoy.RoutedVia`: a request answers 200 and went to the cluster you expect.
 - Package `match`: composable matchers for resources, messages, the order things happened in, and what Envoy holds.
-- Package `conformance`: the conformance suite.
 
 ### Container runtimes
 
@@ -62,9 +60,9 @@ assertions you use.
 
 ### Envoy's config
 
-Write a bootstrap config for the Envoy under test. The suite's
-[`envoy-sotw.yaml`](conformance/envoy-sotw.yaml) and [`envoy-delta.yaml`](conformance/envoy-delta.yaml) make a good
-start. It must:
+Write a bootstrap config for the Envoy under test. The example's
+[`envoy-sotw.yaml`](examples/controlplane/testdata/envoy-sotw.yaml) and
+[`envoy-delta.yaml`](examples/controlplane/testdata/envoy-delta.yaml) make a good start. It must:
 
 - put the admin interface on `0.0.0.0:9901`;
 - point ADS at `host.testcontainers.internal` (`xdstest.HostInternal`), on port `${ADS_PORT}`, which `StartEnvoy`
@@ -221,106 +219,6 @@ conversation before it: Envoy keeps its config across the disconnect, so make be
 - Envoy connects to whichever `ADSPort` you give it, so tests on free ports can run in parallel.
 - Take a `Checkpoint` after Envoy has synced. Then checks only look at what happened since.
 
-## Conformance suite for xDS libraries
-
-Package `conformance` checks the layer that serves config to Envoy: given desired config, does a real Envoy get there
-safely? It doesn't test how a control plane decides what to serve. For that, write your own scenarios as above.
-
-Implement `conformance.ControlPlane` for your library, and call `conformance.Run` once. Here it is for go-control-plane;
-[`examples/conformance`](examples/conformance/conformance_test.go) is the runnable version.
-
-```go
-type goControlPlane struct {
-	cache   cache.SnapshotCache
-	server  server.Server
-	version atomic.Int64
-}
-
-func (g *goControlPlane) Register(s *grpc.Server) {
-	discoveryv3.RegisterAggregatedDiscoveryServiceServer(s, g.server)
-}
-
-// SetConfig replaces the whole desired config: Clusters, ClusterLoadAssignments, Listeners, RouteConfigurations,
-// ScopedRouteConfigurations and VirtualHosts.
-func (g *goControlPlane) SetConfig(resources []proto.Message) {
-	// Group resources by type into a cache.NewSnapshot, with an entry for every type even if empty, then:
-	g.cache.SetSnapshot(context.Background(), "test-envoy-0", snapshot)
-}
-
-func TestConformance(t *testing.T) {
-	conformance.Run(t, conformance.Options{
-		New: func(*testing.T) conformance.ControlPlane {
-			c := cache.NewSnapshotCache(true, cache.IDHash{}, nil)
-			return &goControlPlane{cache: c, server: server.NewServer(context.Background(), c, nil)}
-		},
-	})
-}
-```
-
-Expect that example to fail: go-control-plane fails most of the suite, and the comment at the top of the example lists
-each failure and why. In short: it applies a snapshot one type at a time without waiting for ACKs, which breaks make
-before break; in ADS mode it doesn't answer a request for a name it doesn't have; and on SotW it sends a rejected
-cluster again.
-
-Implement `Idle() bool` too (`conformance.IdleReporter`) if your library can tell when its latest stream is idle, and
-`Resync()` (`conformance.Resyncer`) if it can make Envoy reconnect.
-
-The suite owns the matrix, so every library is tested the same way. It runs every scenario:
-- on both protocols, unless `Options.Protocols` narrows it for a library that only does one. The on-demand cluster and
-  virtual host scenarios run on delta only, as Envoy only does those over delta;
-- on each of `conformance.EnvoyImages`, the oldest Envoy release upstream still supports (1.36) and the newest (1.40).
-  Set `Options.EnvoyImages` to run on others, e.g. every supported release;
-- with Envoy getting listeners from the control plane (LDS) as well as its static listener, so serve LDS too, and
-  scoped route configs (SRDS) and virtual hosts (VHDS) for the scenarios that use them;
-- normally, and with Envoy's requests to the control plane rate limited (`rate_limit_settings`). Envoy then queues
-  them, and delta Envoy sends ACKs ahead of queued subscriptions, so after a reconnect requests arrive in a different
-  order. The reconnect scenarios check the limit was actually hit.
-
-That's 104 subtests and takes several minutes, so run it in CI or before a release rather than on every build. Subtests
-are named by their path, e.g. `TestConformance/sotw/v1.36/rate-limited/StartsEmpty`. The scenarios:
-
-- `StartsEmpty`: no config at first. Envoy gets an answer for every type it asks for, including a route config that
-  doesn't exist yet, then takes the first service.
-- `AddsAndRemovesServices`: a route, its cluster and its endpoints added in one change, then removed in one change.
-  It also adds a cluster with no endpoints, which still needs an empty assignment, or Envoy leaves it warming.
-- `ChangesEndpoints`: only a service's endpoints change, the commonest change in a mesh: one is replaced and one
-  added, then one removed. Envoy must route to the new endpoints, without rebuilding the cluster.
-- `MovesRouteToNewCluster`: a route moved to a new cluster, and the old cluster removed, in one change.
-- `AddsAndRemovesListener`: a listener, its route config, cluster and endpoints added in one change, then removed in
-  one change. The listener mustn't be left warming, and a route config mustn't go while a listener Envoy has uses it.
-- `Churns`: twenty changes in quick succession, each moving a route to a new cluster. Envoy must end on the last, with
-  no stale clusters, make before break throughout.
-- `ContainsRejectedConfig`: Envoy NACKs a bad cluster. The library mustn't send it again, not even as part of a later
-  change, nor drop Envoy into a reconnect loop, and Envoy must keep serving its last good config. If it implements
-  `conformance.Resyncer`, a fixed config must get through after `Resync()`.
-- `ControlPlaneRestarts`: Envoy reconnects to a fresh control plane with different config. The new control plane never
-  sent what Envoy kept, so it can only go by what Envoy tells it.
-- `Reconnects`: a service is removed while Envoy is disconnected. After it reconnects, traffic still flows and updates
-  still work.
-- `ChangesWhileDisconnected`: a route moves to a new cluster, and the old cluster is removed, while Envoy is
-  disconnected. Envoy keeps its config across the disconnect, so after it reconnects the move must be make before break
-  from there.
-- `ScopedRoutes`: a listener picks a scope (SRDS) by the Host header, and each scope names its own route config. A
-  scope, its route config and cluster are added in one change, then removed in one change: the scope must go before its
-  route config, and the route config before its cluster.
-- `OnDemandScopes`: as `ScopedRoutes`, but on demand. Envoy asks for a scope's route config when the first request for
-  it arrives, and that first request must succeed.
-- `OnDemandClusters` (ODCDS): Envoy subscribes to no clusters as it starts, and asks for one, then its endpoints, when
-  the first request routed to it arrives. That first request must succeed.
-- `OnDemandVirtualHosts` (VHDS): Envoy's route config has no virtual hosts of its own. Envoy holds it until it gets
-  virtual hosts named `<route config>/...`, so a library sends some to start, and others when Envoy asks for one on the
-  first request for its host. Either way, requests for each host get routed. It's skipped on Envoy 1.36, which only
-  takes VHDS from a config source of its own, not over ADS.
-
-After each change, the suite checks that the conversation stayed sane. Every response was ACKed, nothing was sent
-unasked, there were no empty responses, and changes were make before break. It also checks that Envoy is healthy and
-logged no warnings. To record a known deviation, add it to `Options.Skip`, with the reason. Keys are parts of a test's
-path, so `"sotw/ChangesWhileDisconnected"` skips that scenario on SotW, on every version and mode.
-
-Envoy's config uses node id `test-envoy-0` and cluster `test-cluster`. Each test's control plane listens on a free
-port, so tests run in parallel, each with its own Envoy, as many at once as `go test -parallel` allows (by default
-GOMAXPROCS). `New` is called concurrently: if the control planes it returns share state, set `Options.Serial`.
-
 ## Examples
 
 Each example in `examples` is its own module, with everything it needs, so you can copy one directory and start from
@@ -333,4 +231,3 @@ cd examples/controlplane && go test ./...
 Their tests run in parallel, each with its own Envoy; `go test -parallel 4 ./...` runs at most four at once.
 
 - [`controlplane`](examples/controlplane): testing your own control plane, as in "A test" above.
-- [`conformance`](examples/conformance): the conformance suite against go-control-plane. It's expected to fail.
